@@ -908,8 +908,8 @@ static IRExpr* realAddr( IRExpr* segaddr ,IRExpr* addr )
 
 static IRExpr* loadRealLE ( IRType ty, Int sreg , IRExpr* addr)
 {
-   if((!IS_EXPLICIT_BIT_SET(sreg) && ignore_seg_mode) || sreg == -1){
-      return LoadLE(ty, addr);
+   if(( !IS_EXPLICIT_BIT_SET(sreg) && ignore_seg_mode) || sreg == -1){
+      return loadLE(ty, addr);
    }
    return loadLE( ty, realAddr(getSReg(sreg), addr ));
 }
