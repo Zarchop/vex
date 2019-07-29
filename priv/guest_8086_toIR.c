@@ -2441,7 +2441,7 @@ UInt fix_ip(UInt Eip){
    located in host memory at &guest_code[delta].  *expect_CAS is set
    to True if the resulting IR is expected to contain an IRCAS
    statement, and False if it's not expected to.  This makes it
-   possible for the caller of disInstr_X86_WRK to check that
+   possible for the caller of disInstr_8086_WRK to check that
    LOCK-prefixed instructions are at least plausibly translated, in
    that it becomes possible to check that a (validly) LOCK-prefixed
    instruction generates a translation containing an IRCAS, and
@@ -2481,7 +2481,7 @@ DisResult disInstr_8086_WRK (
    /* we keep using sz in order to avoid changing a lot of code without
     * any gain. So sz is equal to the current_sz_data.
     */
-   Int sz;
+   Int sz = 2;
 
    /* sorb holds the segment-override-prefix byte, if any.  Zero if no
       prefix has been seen, else one of {0x26, 0x36, 0x3E, 0x64, 0x65}
@@ -4522,6 +4522,25 @@ DisResult disInstr_8086 ( IRSB*        irsb_IN,
 
    x1 = irsb_IN->stmts_used;
    expect_CAS = False;
+	
+   ignore_seg_mode = archinfo->i8086_ignore_seg_mode;
+   if((archinfo->i8086_cs_reg & UNSET_SEG_REG == 0))
+   {
+      putSReg(R_CS, mkU16(archinfo->i8086_cs_reg & 0xffff));
+   }
+   if((archinfo->i8086_ds_reg & UNSET_SEG_REG == 0))
+   {
+      putSReg(R_DS, mkU16(archinfo->i8086_ds_reg & 0xffff));
+   }
+   if((archinfo->i8086_es_reg & UNSET_SEG_REG == 0))
+   {
+      putSReg(R_ES, mkU16(archinfo->i8086_es_reg & 0xffff));
+   }
+   if((archinfo->i8086_ss_reg & UNSET_SEG_REG == 0))
+   {
+      putSReg(R_SS, mkU16(archinfo->i8086_ss_reg & 0xffff));
+   }
+	
    dres = disInstr_8086_WRK ( &expect_CAS, resteerOkFn,
                              resteerCisOk,
                              callback_opaque,
