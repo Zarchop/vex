@@ -330,6 +330,9 @@ typedef
       /* x86 cr0 register value, useful for distinguishing real/protected
        * mode when decoding instructions */
       UInt x86_cr0;
+      /* 8086 angr specific mode - causes processor to ignore implcit use
+       * of segmentation registers */
+      UInt i8086_ignore_seg_mode;
    }
    VexArchInfo;
 
