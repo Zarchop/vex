@@ -1,9 +1,7 @@
 #include "libvex_basictypes.h"
 #include "libvex_ir.h"
 #include "libvex.h"
-#include "libvex_guest_8086.h"
 #include "libvex_guest_x86.h"
-
 
 #include "main_util.h"
 #include "main_globals.h"
@@ -63,6 +61,7 @@ static Bool ignore_seg_mode;
       vex_sprintf(buf, format, __VA_ARGS__)
 #endif
 
+#define UNINITALIZED_SREG (0x80000000)
 #define EXPLICIT_BIT (0x80)
 #define IS_EXPLICIT_BIT_SET(sreg) (0x80 & sreg)
 
@@ -508,6 +507,7 @@ static void casLE ( IRExpr* addr, IRExpr* expVal, IRExpr* newVal,
 
 
 
+
 /*------------------------------------------------------------*/
 /*--- Helpers for %eflags.                                 ---*/
 /*------------------------------------------------------------*/
@@ -583,8 +583,323 @@ static IRExpr* mk_x86g_calculate_eflags_c ( void )
    return call;
 }
 
+
+/* -------------- Building the flags-thunk. -------------- */
+
+/* The machinery in this section builds the flag-thunk following a
+   flag-setting operation.  Hence the various setFlags_* functions.
+*/
+
+static Bool isAddSub ( IROp op8 )
+{
+   return toBool(op8 == Iop_Add8 || op8 == Iop_Sub8);
+}
+
+static Bool isLogic ( IROp op8 )
+{
+   return toBool(op8 == Iop_And8 || op8 == Iop_Or8 || op8 == Iop_Xor8);
+}
+
+/* U-widen 8/16/32 bit int expr to 32. */
+static IRExpr* widenUto32 ( IRExpr* e )
+{
+   switch (typeOfIRExpr(irsb->tyenv,e)) {
+      case Ity_I32: return e;
+      case Ity_I16: return unop(Iop_16Uto32,e);
+      case Ity_I8:  return unop(Iop_8Uto32,e);
+      default: vpanic("widenUto32");
+   }
+}
+
+/* S-widen 8/16/32 bit int expr to 32. */
+static IRExpr* widenSto32 ( IRExpr* e )
+{
+   switch (typeOfIRExpr(irsb->tyenv,e)) {
+      case Ity_I32: return e;
+      case Ity_I16: return unop(Iop_16Sto32,e);
+      case Ity_I8:  return unop(Iop_8Sto32,e);
+      default: vpanic("widenSto32");
+   }
+}
+
+/* Narrow 8/16/32 bit int expr to 8/16/32.  Clearly only some
+   of these combinations make sense. */
+static IRExpr* narrowTo ( IRType dst_ty, IRExpr* e )
+{
+   IRType src_ty = typeOfIRExpr(irsb->tyenv,e);
+   if (src_ty == dst_ty)
+      return e;
+   if (src_ty == Ity_I32 && dst_ty == Ity_I16)
+      return unop(Iop_32to16, e);
+   if (src_ty == Ity_I32 && dst_ty == Ity_I8)
+      return unop(Iop_32to8, e);
+
+   vex_printf("\nsrc, dst tys are: ");
+   ppIRType(src_ty);
+   vex_printf(", ");
+   ppIRType(dst_ty);
+   vex_printf("\n");
+   vpanic("narrowTo(x86)");
+}
+
+
+/* Set the flags thunk OP, DEP1 and DEP2 fields.  The supplied op is
+   auto-sized up to the real op. */
+
+static 
+void setFlags_DEP1_DEP2 ( IROp op8, IRTemp dep1, IRTemp dep2, IRType ty )
+{
+   Int ccOp = ty==Ity_I8 ? 0 : (ty==Ity_I16 ? 1 : 2);
+
+   vassert(ty == Ity_I8 || ty == Ity_I16 || ty == Ity_I32);
+
+   switch (op8) {
+      case Iop_Add8: ccOp += X86G_CC_OP_ADDB;   break;
+      case Iop_Sub8: ccOp += X86G_CC_OP_SUBB;   break;
+      default:       ppIROp(op8);
+                     vpanic("setFlags_DEP1_DEP2(x86)");
+   }
+   stmt( IRStmt_Put( OFFB_CC_OP,   mkU32(ccOp)) );
+   stmt( IRStmt_Put( OFFB_CC_DEP1, widenUto32(mkexpr(dep1))) );
+   stmt( IRStmt_Put( OFFB_CC_DEP2, widenUto32(mkexpr(dep2))) );
+   /* Set NDEP even though it isn't used.  This makes redundant-PUT
+      elimination of previous stores to this field work better. */
+   stmt( IRStmt_Put( OFFB_CC_NDEP, mkU32(0) ));
+}
+
+
+/* Set the OP and DEP1 fields only, and write zero to DEP2. */
+
+static 
+void setFlags_DEP1 ( IROp op8, IRTemp dep1, IRType ty )
+{
+   Int ccOp = ty==Ity_I8 ? 0 : (ty==Ity_I16 ? 1 : 2);
+
+   vassert(ty == Ity_I8 || ty == Ity_I16 || ty == Ity_I32);
+
+   switch (op8) {
+      case Iop_Or8:
+      case Iop_And8:
+      case Iop_Xor8: ccOp += X86G_CC_OP_LOGICB; break;
+      default:       ppIROp(op8);
+                     vpanic("setFlags_DEP1(x86)");
+   }
+   stmt( IRStmt_Put( OFFB_CC_OP,   mkU32(ccOp)) );
+   stmt( IRStmt_Put( OFFB_CC_DEP1, widenUto32(mkexpr(dep1))) );
+   stmt( IRStmt_Put( OFFB_CC_DEP2, mkU32(0)) );
+   /* Set NDEP even though it isn't used.  This makes redundant-PUT
+      elimination of previous stores to this field work better. */
+   stmt( IRStmt_Put( OFFB_CC_NDEP, mkU32(0) ));
+}
+
+
+/* For shift operations, we put in the result and the undershifted
+   result.  Except if the shift amount is zero, the thunk is left
+   unchanged. */
+
+static void setFlags_DEP1_DEP2_shift ( IROp    op32,
+                                       IRTemp  res,
+                                       IRTemp  resUS,
+                                       IRType  ty,
+                                       IRTemp  guard )
+{
+   Int ccOp = ty==Ity_I8 ? 2 : (ty==Ity_I16 ? 1 : 0);
+
+   vassert(ty == Ity_I8 || ty == Ity_I16 || ty == Ity_I32);
+   vassert(guard);
+
+   /* Both kinds of right shifts are handled by the same thunk
+      operation. */
+   switch (op32) {
+      case Iop_Shr32:
+      case Iop_Sar32: ccOp = X86G_CC_OP_SHRL - ccOp; break;
+      case Iop_Shl32: ccOp = X86G_CC_OP_SHLL - ccOp; break;
+      default:        ppIROp(op32);
+                      vpanic("setFlags_DEP1_DEP2_shift(x86)");
+   }
+
+   /* guard :: Ity_I8.  We need to convert it to I1. */
+   IRTemp guardB = newTemp(Ity_I1);
+   assign( guardB, binop(Iop_CmpNE8, mkexpr(guard), mkU8(0)) );
+
+   /* DEP1 contains the result, DEP2 contains the undershifted value. */
+   stmt( IRStmt_Put( OFFB_CC_OP,
+                     IRExpr_ITE( mkexpr(guardB),
+                                 mkU32(ccOp),
+                                 IRExpr_Get(OFFB_CC_OP,Ity_I32) ) ));
+   stmt( IRStmt_Put( OFFB_CC_DEP1,
+                     IRExpr_ITE( mkexpr(guardB),
+                                 widenUto32(mkexpr(res)),
+                                 IRExpr_Get(OFFB_CC_DEP1,Ity_I32) ) ));
+   stmt( IRStmt_Put( OFFB_CC_DEP2, 
+                     IRExpr_ITE( mkexpr(guardB),
+                                 widenUto32(mkexpr(resUS)),
+                                 IRExpr_Get(OFFB_CC_DEP2,Ity_I32) ) ));
+   /* Set NDEP even though it isn't used.  This makes redundant-PUT
+      elimination of previous stores to this field work better. */
+   stmt( IRStmt_Put( OFFB_CC_NDEP,
+                     IRExpr_ITE( mkexpr(guardB),
+                                 mkU32(0),
+                                 IRExpr_Get(OFFB_CC_NDEP,Ity_I32) ) ));
+}
+
+
+/* For the inc/dec case, we store in DEP1 the result value and in NDEP
+   the former value of the carry flag, which unfortunately we have to
+   compute. */
+
+static void setFlags_INC_DEC ( Bool inc, IRTemp res, IRType ty )
+{
+   Int ccOp = inc ? X86G_CC_OP_INCB : X86G_CC_OP_DECB;
+   
+   ccOp += ty==Ity_I8 ? 0 : (ty==Ity_I16 ? 1 : 2);
+   vassert(ty == Ity_I8 || ty == Ity_I16 || ty == Ity_I32);
+
+   /* This has to come first, because calculating the C flag 
+      may require reading all four thunk fields. */
+   stmt( IRStmt_Put( OFFB_CC_NDEP, mk_x86g_calculate_eflags_c()) );
+   stmt( IRStmt_Put( OFFB_CC_OP,   mkU32(ccOp)) );
+   stmt( IRStmt_Put( OFFB_CC_DEP1, widenUto32(mkexpr(res))) );
+   stmt( IRStmt_Put( OFFB_CC_DEP2, mkU32(0)) );
+}
+
+
+/* Multiplies are pretty much like add and sub: DEP1 and DEP2 hold the
+   two arguments. */
+
+static
+void setFlags_MUL ( IRType ty, IRTemp arg1, IRTemp arg2, UInt base_op )
+{
+   switch (ty) {
+      case Ity_I8:
+         stmt( IRStmt_Put( OFFB_CC_OP, mkU32(base_op+0) ) );
+         break;
+      case Ity_I16:
+         stmt( IRStmt_Put( OFFB_CC_OP, mkU32(base_op+1) ) );
+         break;
+      case Ity_I32:
+         stmt( IRStmt_Put( OFFB_CC_OP, mkU32(base_op+2) ) );
+         break;
+      default:
+         vpanic("setFlags_MUL(x86)");
+   }
+   stmt( IRStmt_Put( OFFB_CC_DEP1, widenUto32(mkexpr(arg1)) ));
+   stmt( IRStmt_Put( OFFB_CC_DEP2, widenUto32(mkexpr(arg2)) ));
+   /* Set NDEP even though it isn't used.  This makes redundant-PUT
+      elimination of previous stores to this field work better. */
+   stmt( IRStmt_Put( OFFB_CC_NDEP, mkU32(0) ));
+}
+
+
+/* --- Set the emulation-warning pseudo-register. --- */
+
+static void put_emwarn ( IRExpr* e /* :: Ity_I32 */ )
+{
+   vassert(typeOfIRExpr(irsb->tyenv, e) == Ity_I32);
+   stmt( IRStmt_Put( OFFB_EMNOTE, e ) );
+}
+
+/* Generate IR to set the guest %EFLAGS from the pushfl-format image
+   in the given 32-bit temporary.  The flags that are set are: O S Z A
+   C P D ID AC.
+
+   In all cases, code to set AC is generated.  However, VEX actually
+   ignores the AC value and so can optionally emit an emulation
+   warning when it is enabled.  In this routine, an emulation warning
+   is only emitted if emit_AC_emwarn is True, in which case
+   next_insn_EIP must be correct (this allows for correct code
+   generation for popfl/popfw).  If emit_AC_emwarn is False,
+   next_insn_EIP is unimportant (this allows for easy if kludgey code
+   generation for IRET.) */
+
+static 
+void set_EFLAGS_from_value ( IRTemp t1, 
+                             Bool   emit_AC_emwarn,
+                             Addr32 next_insn_EIP )
+{
+   vassert(typeOfIRTemp(irsb->tyenv,t1) == Ity_I32);
+
+   /* t1 is the flag word.  Mask out everything except OSZACP and set
+      the flags thunk to X86G_CC_OP_COPY. */
+   stmt( IRStmt_Put( OFFB_CC_OP,   mkU32(X86G_CC_OP_COPY) ));
+   stmt( IRStmt_Put( OFFB_CC_DEP2, mkU32(0) ));
+   stmt( IRStmt_Put( OFFB_CC_DEP1, 
+                     binop(Iop_And32,
+                           mkexpr(t1), 
+                           mkU32( X86G_CC_MASK_C | X86G_CC_MASK_P 
+                                  | X86G_CC_MASK_A | X86G_CC_MASK_Z 
+                                  | X86G_CC_MASK_S| X86G_CC_MASK_O )
+                          )
+                    )
+       );
+   /* Set NDEP even though it isn't used.  This makes redundant-PUT
+      elimination of previous stores to this field work better. */
+   stmt( IRStmt_Put( OFFB_CC_NDEP, mkU32(0) ));
+
+   /* Also need to set the D flag, which is held in bit 10 of t1.
+      If zero, put 1 in OFFB_DFLAG, else -1 in OFFB_DFLAG. */
+   stmt( IRStmt_Put( 
+            OFFB_DFLAG,
+            IRExpr_ITE( 
+               unop(Iop_32to1,
+                    binop(Iop_And32, 
+                          binop(Iop_Shr32, mkexpr(t1), mkU8(10)), 
+                          mkU32(1))),
+               mkU32(0xFFFFFFFF),
+               mkU32(1)))
+       );
+
+   /* Set the ID flag */
+   stmt( IRStmt_Put( 
+            OFFB_IDFLAG,
+            IRExpr_ITE( 
+               unop(Iop_32to1,
+                    binop(Iop_And32, 
+                          binop(Iop_Shr32, mkexpr(t1), mkU8(21)), 
+                          mkU32(1))),
+               mkU32(1),
+               mkU32(0)))
+       );
+
+   /* And set the AC flag.  If setting it 1 to, possibly emit an
+      emulation warning. */
+   stmt( IRStmt_Put( 
+            OFFB_ACFLAG,
+            IRExpr_ITE( 
+               unop(Iop_32to1,
+                    binop(Iop_And32, 
+                          binop(Iop_Shr32, mkexpr(t1), mkU8(18)), 
+                          mkU32(1))),
+               mkU32(1),
+               mkU32(0)))
+       );
+
+   if (emit_AC_emwarn) {
+      put_emwarn( mkU32(EmWarn_X86_acFlag) );
+      stmt( 
+         IRStmt_Exit(
+            binop( Iop_CmpNE32, 
+                   binop(Iop_And32, mkexpr(t1), mkU32(1<<18)), 
+                   mkU32(0) ),
+            Ijk_EmWarn,
+            IRConst_U32( next_insn_EIP ),
+            OFFB_EIP
+         )
+      );
+   }
+}
+
 #define is_bit_set(var,pos) ((var & (1<<pos))>>pos)
 #define SEG_SHIFT (4)
+
+static
+UInt fix_ip(UInt Eip){
+   UInt ip = Eip - (guest_CS_bbstart << SEG_SHIFT);
+   vassert((Int)ip >= 0);
+   ip &= 0xffff;
+
+   return (ip + (guest_CS_bbstart << SEG_SHIFT));
+}
 
 static IRExpr* realAddr( IRExpr* segaddr ,IRExpr* addr )
 {
@@ -602,221 +917,52 @@ static IRExpr* loadRealLE ( IRType ty, Int sreg , IRExpr* addr)
 static void storeRealLE ( IRExpr* addr,Int sreg,  IRExpr* data)
 {
    if((!IS_EXPLICIT_BIT_SET(sreg) && ignore_seg_mode) || sreg == -1){
-      return storeLE(addr, data);
+      storeLE(addr, data);
+      return;
    }
    storeLE(realAddr(getSReg(sreg), addr),data);
 }
 
-static IRTemp disAMode_copy2tmp ( IRExpr* addr32 )
+/* -------------- Condition codes. -------------- */
+
+/* Condition codes, using the Intel encoding.  */
+
+static const HChar* name_X86Condcode ( X86Condcode cond )
 {
-   IRTemp tmp = newTemp(Ity_I16);
-   assign( tmp, addr32 );
-   return tmp;
-}
-
-static
-IRTemp disAMode ( Int* len, UChar* sorb, Int delta, HChar* buf ) {
-   UChar mod_reg_rm = getIByte(delta);
-   UChar mod, rm;
-
-   delta++;
-
-   buf[0] = (UChar)0;
-
-   /* squeeze out the reg field from mod_reg_rm, since a 256-entry
-      jump table seems a bit excessive.
-   */
-   mod_reg_rm &= 0xC7;                      /* is now XX000YYY */
-   mod_reg_rm  = toUChar(mod_reg_rm | (mod_reg_rm >> 3));
-                                            /* is now XX0XXYYY */
-   mod_reg_rm &= 0x1F;             /* is now 000XXYYY */
-   rm = mod_reg_rm & 0x7;
-   mod = mod_reg_rm >> 6;
-   UInt d;
-   /* 0x6 is a special case because we can't
-    * deref %bp without displacement */
-   if(mod_reg_rm == 0x6)
-   {
-	 UInt d = getUDisp16(delta);
-	 *len = 3;
-	  DIS(buf, "%s(0x%x)", sorbTxt(sorb), d);
-      return disAMode_copy2tmp(mkU16(d));
+   switch (cond) {
+      case X86CondO:      return "o";
+      case X86CondNO:     return "no";
+      case X86CondB:      return "b";
+      case X86CondNB:     return "nb";
+      case X86CondZ:      return "z";
+      case X86CondNZ:     return "nz";
+      case X86CondBE:     return "be";
+      case X86CondNBE:    return "nbe";
+      case X86CondS:      return "s";
+      case X86CondNS:     return "ns";
+      case X86CondP:      return "p";
+      case X86CondNP:     return "np";
+      case X86CondL:      return "l";
+      case X86CondNL:     return "nl";
+      case X86CondLE:     return "le";
+      case X86CondNLE:    return "nle";
+      case X86CondAlways: return "ALWAYS";
+      default: vpanic("name_X86Condcode");
    }
-   switch(mod){
-      case 0x00:
-	  d = 0;
-	  *len = 1;
-	  break;
-	  case 0x01:
-	  d = getUDisp8(delta);
-	  *len = 2;
-	  break;
-	  case 0x02:
-	  d = getUDisp16(delta);
-	  *len = 3;
-	  break;
-	  case 0x03:
-	  vpanic("disAMode(x86): not an addr!");
-   }
-   switch (rm){
-      case 0x00: case 0x01: case 0x04: case 0x05: case 0x07:
-      if((!ignore_seg_mode) && (!sorb)){
-        *sorb = R_DS;
-     }
-     break;
-      case 0x02: case 0x03: case 0x06:
-      if((!ignore_seg_mode) && (!sorb)){
-        *sorb = R_SS;
-     }
-   }
-   IRExpr* deref_vaddr;
-   switch (rm){
-	  case 0x00:
-	  deref_vaddr = binop(Iop_Add16,getIReg(2, R_EBX),getIReg(2, R_ESI));
-	  break;
-	  case 0x01:
-	  deref_vaddr = binop(Iop_Add16,getIReg(2, R_EBX),getIReg(2, R_EDI));
-	  break;
-	  case 0x02:
-	  deref_vaddr = binop(Iop_Add16,getIReg(2, R_EBP),getIReg(2, R_ESI));
-	  break;
-	  case 0x03:
-	  deref_vaddr = binop(Iop_Add16,getIReg(2, R_EBP),getIReg(2, R_EDI));
-	  break;
-	  case 0x04:
-	  deref_vaddr = IRExpr_Get(OFFB_ESI,szToITy(2));
-	  break;
-	  case 0x05:
-	  deref_vaddr = IRExpr_Get(OFFB_EDI,szToITy(2));
-	  break;
-	  case 0x06:
-	  deref_vaddr = IRExpr_Get(OFFB_EBP,szToITy(2));
-	  break;
-	  case 0x07:
-	  deref_vaddr = IRExpr_Get(OFFB_EBX,szToITy(2));
-	  break;
-   }
-   return disAMode_copy2tmp(binop(Iop_Add16,deref_vaddr,mkU16(d)));
-
 }
 
 static 
-void dis_MOVS ( Int sz, IRTemp t_inc )
+X86Condcode positiveIse_X86Condcode ( X86Condcode  cond,
+                                      Bool*        needInvert )
 {
-   IRType ty = szToITy(sz);
-   IRTemp td = newTemp(Ity_I32);   /* EDI */
-   IRTemp ts = newTemp(Ity_I32);   /* ESI */
-
-   assign( td, getIReg(4, R_EDI) );
-   assign( ts, getIReg(4, R_ESI) );
-
-   storeRealLE( mkexpr(td),R_ES, loadRealLE(ty, R_DS,mkexpr(ts)) );
-
-   putIReg( 4, R_EDI, binop(Iop_Add32, mkexpr(td), mkexpr(t_inc)) );
-   putIReg( 4, R_ESI, binop(Iop_Add32, mkexpr(ts), mkexpr(t_inc)) );
-}
-
-static 
-void dis_LODS ( Int sz, IRTemp t_inc )
-{
-   IRType ty = szToITy(sz);
-   IRTemp ts = newTemp(Ity_I32);   /* ESI */
-
-   assign( ts, getIReg(4, R_ESI) );
-
-   putIReg( sz, R_EAX, loadRealLE(ty,R_DS, mkexpr(ts)) );
-
-   putIReg( 4, R_ESI, binop(Iop_Add32, mkexpr(ts), mkexpr(t_inc)) );
-}
-
-static 
-void dis_STOS ( Int sz, IRTemp t_inc )
-{
-   IRType ty = szToITy(sz);
-   IRTemp ta = newTemp(ty);        /* EAX */
-   IRTemp td = newTemp(Ity_I32);   /* EDI */
-
-   assign( ta, getIReg(sz, R_EAX) );
-   assign( td, getIReg(4, R_EDI) );
-
-   storeRealLE( mkexpr(td), R_ES, mkexpr(ta) );
-
-   putIReg( 4, R_EDI, binop(Iop_Add32, mkexpr(td), mkexpr(t_inc)) );
-}
-
-static 
-void dis_CMPS ( Int sz, IRTemp t_inc )
-{
-   IRType ty  = szToITy(sz);
-   IRTemp tdv = newTemp(ty);      /* (EDI) */
-   IRTemp tsv = newTemp(ty);      /* (ESI) */
-   IRTemp td  = newTemp(Ity_I32); /*  EDI  */
-   IRTemp ts  = newTemp(Ity_I32); /*  ESI  */
-
-   assign( td, getIReg(4, R_EDI) );
-   assign( ts, getIReg(4, R_ESI) );
-
-   assign( tdv, loadRealLE(ty,R_ES,mkexpr(td)) );
-   assign( tsv, loadRealLE(ty,R_DS,mkexpr(ts)) );
-
-   setFlags_DEP1_DEP2 ( Iop_Sub8, tsv, tdv, ty );
-
-   putIReg(4, R_EDI, binop(Iop_Add32, mkexpr(td), mkexpr(t_inc)) );
-   putIReg(4, R_ESI, binop(Iop_Add32, mkexpr(ts), mkexpr(t_inc)) );
-}
-
-static 
-void dis_SCAS ( Int sz, IRTemp t_inc )
-{
-   IRType ty  = szToITy(sz);
-   IRTemp ta  = newTemp(ty);       /*  EAX  */
-   IRTemp td  = newTemp(Ity_I32);  /*  EDI  */
-   IRTemp tdv = newTemp(ty);       /* (EDI) */
-
-   assign( ta, getIReg(sz, R_EAX) );
-   assign( td, getIReg(4, R_EDI) );
-
-   assign( tdv, loadRealLE(ty,R_ES,mkexpr(td)) );
-   setFlags_DEP1_DEP2 ( Iop_Sub8, ta, tdv, ty );
-
-   putIReg(4, R_EDI, binop(Iop_Add32, mkexpr(td), mkexpr(t_inc)) );
-}
-
-
-/* Wrap the appropriate string op inside a REP/REPE/REPNE.
-   We assume the insn is the last one in the basic block, and so emit a jump
-   to the next insn, rather than just falling through. */
-static 
-void dis_REP_op ( /*MOD*/DisResult* dres,
-                  X86Condcode cond,
-                  void (*dis_OP)(Int, IRTemp),
-                  Int sz, Addr32 eip, Addr32 eip_next, const HChar* name )
-{
-   IRTemp t_inc = newTemp(Ity_I32);
-   IRTemp tc    = newTemp(Ity_I32);  /*  ECX  */
-
-   assign( tc, getIReg(4,R_ECX) );
-
-   stmt( IRStmt_Exit( binop(Iop_CmpEQ32,mkexpr(tc),mkU32(0)),
-                      Ijk_Boring,
-                      IRConst_U32(eip_next), OFFB_EIP ) );
-
-   putIReg(4, R_ECX, binop(Iop_Sub32, mkexpr(tc), mkU32(1)) );
-
-   dis_string_op_increment(sz, t_inc);
-   dis_OP (sz, t_inc);
-
-   if (cond == X86CondAlways) {
-      jmp_lit(dres, Ijk_Boring, eip);
-      vassert(dres->whatNext == Dis_StopHere);
+   vassert(cond >= X86CondO && cond <= X86CondNLE);
+   if (cond & 1) {
+      *needInvert = True;
+      return cond-1;
    } else {
-      stmt( IRStmt_Exit( mk_x86g_calculate_condition(cond),
-                         Ijk_Boring,
-                         IRConst_U32(eip), OFFB_EIP ) );
-      jmp_lit(dres, Ijk_Boring, eip_next);
-      vassert(dres->whatNext == Dis_StopHere);
+      *needInvert = False;
+      return cond;
    }
-   DIP("%s%c\n", name, nameISize(sz));
 }
 
 
@@ -944,6 +1090,514 @@ static void helper_SBB ( Int sz,
    stmt( IRStmt_Put( OFFB_CC_DEP2, widenUto32(binop(xor, mkexpr(ta2), 
                                                          mkexpr(oldcn)) )) );
    stmt( IRStmt_Put( OFFB_CC_NDEP, mkexpr(oldc) ) );
+}
+
+/* -------------- Helpers for disassembly printing. -------------- */
+
+static const HChar* nameGrp1 ( Int opc_aux )
+{
+   static const HChar* grp1_names[8] 
+     = { "add", "or", "adc", "sbb", "and", "sub", "xor", "cmp" };
+   if (opc_aux < 0 || opc_aux > 7) vpanic("nameGrp1(x86)");
+   return grp1_names[opc_aux];
+}
+
+static const HChar* nameGrp2 ( Int opc_aux )
+{
+   static const HChar* grp2_names[8] 
+     = { "rol", "ror", "rcl", "rcr", "shl", "shr", "shl", "sar" };
+   if (opc_aux < 0 || opc_aux > 7) vpanic("nameGrp2(x86)");
+   return grp2_names[opc_aux];
+}
+
+static const HChar* nameGrp4 ( Int opc_aux )
+{
+   static const HChar* grp4_names[8] 
+     = { "inc", "dec", "???", "???", "???", "???", "???", "???" };
+   if (opc_aux < 0 || opc_aux > 1) vpanic("nameGrp4(x86)");
+   return grp4_names[opc_aux];
+}
+
+static const HChar* nameGrp5 ( Int opc_aux )
+{
+   static const HChar* grp5_names[8] 
+     = { "inc", "dec", "call*", "call*", "jmp*", "jmp*", "push", "???" };
+   if (opc_aux < 0 || opc_aux > 6) vpanic("nameGrp5(x86)");
+   return grp5_names[opc_aux];
+}
+
+static const HChar* nameGrp8 ( Int opc_aux )
+{
+   static const HChar* grp8_names[8] 
+     = { "???", "???", "???", "???", "bt", "bts", "btr", "btc" };
+   if (opc_aux < 4 || opc_aux > 7) vpanic("nameGrp8(x86)");
+   return grp8_names[opc_aux];
+}
+
+static const HChar* nameIReg ( Int size, Int reg )
+{
+   static const HChar* ireg32_names[8] 
+     = { "%eax", "%ecx", "%edx", "%ebx", 
+         "%esp", "%ebp", "%esi", "%edi" };
+   static const HChar* ireg16_names[8] 
+     = { "%ax", "%cx", "%dx", "%bx", "%sp", "%bp", "%si", "%di" };
+   static const HChar* ireg8_names[8] 
+     = { "%al", "%cl", "%dl", "%bl", 
+         "%ah{sp}", "%ch{bp}", "%dh{si}", "%bh{di}" };
+   if (reg < 0 || reg > 7) goto bad;
+   switch (size) {
+      case 4: return ireg32_names[reg];
+      case 2: return ireg16_names[reg];
+      case 1: return ireg8_names[reg];
+   }
+  bad:
+   vpanic("nameIReg(X86)");
+   return NULL; /*notreached*/
+}
+
+static const HChar* nameSReg ( UInt sreg )
+{
+   switch (sreg) {
+      case R_ES: return "%es";
+      case R_CS: return "%cs";
+      case R_SS: return "%ss";
+      case R_DS: return "%ds";
+      case R_FS: return "%fs";
+      case R_GS: return "%gs";
+      default: vpanic("nameSReg(x86)");
+   }
+}
+
+static const HChar* nameMMXReg ( Int mmxreg )
+{
+   static const HChar* mmx_names[8] 
+     = { "%mm0", "%mm1", "%mm2", "%mm3", "%mm4", "%mm5", "%mm6", "%mm7" };
+   if (mmxreg < 0 || mmxreg > 7) vpanic("nameMMXReg(x86,guest)");
+   return mmx_names[mmxreg];
+}
+
+static const HChar* nameXMMReg ( Int xmmreg )
+{
+   static const HChar* xmm_names[8] 
+     = { "%xmm0", "%xmm1", "%xmm2", "%xmm3", 
+         "%xmm4", "%xmm5", "%xmm6", "%xmm7" };
+   if (xmmreg < 0 || xmmreg > 7) vpanic("name_of_xmm_reg");
+   return xmm_names[xmmreg];
+}
+ 
+static const HChar* nameMMXGran ( Int gran )
+{
+   switch (gran) {
+      case 0: return "b";
+      case 1: return "w";
+      case 2: return "d";
+      case 3: return "q";
+      default: vpanic("nameMMXGran(x86,guest)");
+   }
+}
+
+static HChar nameISize ( Int size )
+{
+   switch (size) {
+      case 4: return 'l';
+      case 2: return 'w';
+      case 1: return 'b';
+      default: vpanic("nameISize(x86)");
+   }
+}
+
+
+/*------------------------------------------------------------*/
+/*--- JMP helpers                                          ---*/
+/*------------------------------------------------------------*/
+
+static void jmp_lit( /*MOD*/DisResult* dres,
+                     IRJumpKind kind, Addr32 d32 )
+{
+   vassert(dres->whatNext    == Dis_Continue);
+   vassert(dres->len         == 0);
+   vassert(dres->continueAt  == 0);
+   vassert(dres->jk_StopHere == Ijk_INVALID);
+   dres->whatNext    = Dis_StopHere;
+   dres->jk_StopHere = kind;
+   stmt( IRStmt_Put( OFFB_EIP, mkU32(d32) ) );
+}
+
+static void jmp_treg( /*MOD*/DisResult* dres,
+                      IRJumpKind kind, IRTemp t )
+{
+   vassert(dres->whatNext    == Dis_Continue);
+   vassert(dres->len         == 0);
+   vassert(dres->continueAt  == 0);
+   vassert(dres->jk_StopHere == Ijk_INVALID);
+   dres->whatNext    = Dis_StopHere;
+   dres->jk_StopHere = kind;
+   stmt( IRStmt_Put( OFFB_EIP, mkexpr(t) ) );
+}
+
+static 
+void jcc_01( /*MOD*/DisResult* dres,
+             X86Condcode cond, Addr32 d32_false, Addr32 d32_true )
+{
+   Bool        invert;
+   X86Condcode condPos;
+   vassert(dres->whatNext    == Dis_Continue);
+   vassert(dres->len         == 0);
+   vassert(dres->continueAt  == 0);
+   vassert(dres->jk_StopHere == Ijk_INVALID);
+   dres->whatNext    = Dis_StopHere;
+   dres->jk_StopHere = Ijk_Boring;
+   condPos = positiveIse_X86Condcode ( cond, &invert );
+   if (invert) {
+      stmt( IRStmt_Exit( mk_x86g_calculate_condition(condPos),
+                         Ijk_Boring,
+                         IRConst_U32(d32_false),
+                         OFFB_EIP ) );
+      stmt( IRStmt_Put( OFFB_EIP, mkU32(d32_true) ) );
+   } else {
+      stmt( IRStmt_Exit( mk_x86g_calculate_condition(condPos),
+                         Ijk_Boring,
+                         IRConst_U32(d32_true),
+                         OFFB_EIP ) );
+      stmt( IRStmt_Put( OFFB_EIP, mkU32(d32_false) ) );
+   }
+}
+
+/*------------------------------------------------------------*/
+/*--- Disassembling addressing modes                       ---*/
+/*------------------------------------------------------------*/
+
+
+
+static 
+const HChar* sorbTxt ( UChar sorb )
+{
+   switch (sorb) {
+
+      case (-1):    return ""; /* no override */
+      case R_CS: return "%cs";
+      case R_DS: return "%ds";
+      case R_ES: return "%es:";
+      case R_SS: return "%ss:";
+      default: vpanic("sorbTxt(x86,guest)");
+   }
+}
+
+
+static IRTemp disAMode_copy2tmp ( IRExpr* addr32 )
+{
+   IRTemp tmp = newTemp(Ity_I16);
+   assign( tmp, addr32 );
+   return tmp;
+}
+
+static
+IRTemp disAMode ( Int* len, UChar* sorb, Int delta, HChar* buf ) {
+   UChar mod_reg_rm = getIByte(delta);
+   UChar mod, rm;
+
+   delta++;
+
+   buf[0] = (UChar)0;
+
+   /* squeeze out the reg field from mod_reg_rm, since a 256-entry
+      jump table seems a bit excessive.
+   */
+   mod_reg_rm &= 0xC7;                      /* is now XX000YYY */
+   mod_reg_rm  = toUChar(mod_reg_rm | (mod_reg_rm >> 3));
+                                            /* is now XX0XXYYY */
+   mod_reg_rm &= 0x1F;             /* is now 000XXYYY */
+   rm = mod_reg_rm & 0x7;
+   mod = mod_reg_rm >> 6;
+   UInt d;
+   /* 0x6 is a special case because we can't
+    * deref %bp without displacement */
+   if(mod_reg_rm == 0x6)
+   {
+	 UInt d = getUDisp16(delta);
+	 *len = 3;
+	  DIS(buf, "%s(0x%x)", sorbTxt(*sorb), d);
+      return disAMode_copy2tmp(mkU16(d));
+   }
+   switch(mod){
+      case 0x00:
+	  d = 0;
+	  *len = 1;
+	  break;
+	  case 0x01:
+	  d = getUChar(delta);
+	  *len = 2;
+	  break;
+	  case 0x02:
+	  d = getUDisp16(delta);
+	  *len = 3;
+	  break;
+	  case 0x03:
+	  vpanic("disAMode(x86): not an addr!");
+   }
+   switch (rm){
+      case 0x00: case 0x01: case 0x04: case 0x05: case 0x07:
+      if((!ignore_seg_mode) && (*sorb == -1)){
+        *sorb = R_DS;
+     }
+     break;
+      case 0x02: case 0x03: case 0x06:
+      if((!ignore_seg_mode) && (*sorb == -1)){
+        *sorb = R_SS;
+     }
+   }
+   IRExpr* deref_vaddr;
+   switch (rm){
+	  case 0x00:
+	  deref_vaddr = binop(Iop_Add16,getIReg(2, R_EBX),getIReg(2, R_ESI));
+	  break;
+	  case 0x01:
+	  deref_vaddr = binop(Iop_Add16,getIReg(2, R_EBX),getIReg(2, R_EDI));
+	  break;
+	  case 0x02:
+	  deref_vaddr = binop(Iop_Add16,getIReg(2, R_EBP),getIReg(2, R_ESI));
+	  break;
+	  case 0x03:
+	  deref_vaddr = binop(Iop_Add16,getIReg(2, R_EBP),getIReg(2, R_EDI));
+	  break;
+	  case 0x04:
+	  deref_vaddr = IRExpr_Get(OFFB_ESI,szToITy(2));
+	  break;
+	  case 0x05:
+	  deref_vaddr = IRExpr_Get(OFFB_EDI,szToITy(2));
+	  break;
+	  case 0x06:
+	  deref_vaddr = IRExpr_Get(OFFB_EBP,szToITy(2));
+	  break;
+	  case 0x07:
+	  deref_vaddr = IRExpr_Get(OFFB_EBX,szToITy(2));
+	  break;
+   }
+   return disAMode_copy2tmp(binop(Iop_Add16,deref_vaddr,mkU16(d)));
+
+}
+
+/* Code shared by all the string ops */
+static
+void dis_string_op_increment(Int sz, Int t_inc)
+{
+   if (sz == 4 || sz == 2) {
+      assign( t_inc, 
+              binop(Iop_Shl32, IRExpr_Get( OFFB_DFLAG, Ity_I32 ),
+                               mkU8(sz/2) ) );
+   } else {
+      assign( t_inc, 
+              IRExpr_Get( OFFB_DFLAG, Ity_I32 ) );
+   }
+}
+
+static
+void dis_string_op( void (*dis_OP)( Int, IRTemp ), 
+                    Int sz, const HChar* name, UChar sorb )
+{
+   IRTemp t_inc = newTemp(Ity_I32);
+   vassert(sorb == 0); /* hmm.  so what was the point of passing it in? */
+   dis_string_op_increment(sz, t_inc);
+   dis_OP( sz, t_inc );
+   DIP("%s%c\n", name, nameISize(sz));
+}
+
+static 
+void dis_MOVS ( Int sz, IRTemp t_inc )
+{
+   IRType ty = szToITy(sz);
+   IRTemp td = newTemp(Ity_I32);   /* EDI */
+   IRTemp ts = newTemp(Ity_I32);   /* ESI */
+
+   assign( td, getIReg(4, R_EDI) );
+   assign( ts, getIReg(4, R_ESI) );
+
+   storeRealLE( mkexpr(td),R_ES, loadRealLE(ty, R_DS,mkexpr(ts)) );
+
+   putIReg( 4, R_EDI, binop(Iop_Add32, mkexpr(td), mkexpr(t_inc)) );
+   putIReg( 4, R_ESI, binop(Iop_Add32, mkexpr(ts), mkexpr(t_inc)) );
+}
+
+static 
+void dis_LODS ( Int sz, IRTemp t_inc )
+{
+   IRType ty = szToITy(sz);
+   IRTemp ts = newTemp(Ity_I32);   /* ESI */
+
+   assign( ts, getIReg(4, R_ESI) );
+
+   putIReg( sz, R_EAX, loadRealLE(ty,R_DS, mkexpr(ts)) );
+
+   putIReg( 4, R_ESI, binop(Iop_Add32, mkexpr(ts), mkexpr(t_inc)) );
+}
+
+static 
+void dis_STOS ( Int sz, IRTemp t_inc )
+{
+   IRType ty = szToITy(sz);
+   IRTemp ta = newTemp(ty);        /* EAX */
+   IRTemp td = newTemp(Ity_I32);   /* EDI */
+
+   assign( ta, getIReg(sz, R_EAX) );
+   assign( td, getIReg(4, R_EDI) );
+
+   storeRealLE( mkexpr(td), R_ES, mkexpr(ta) );
+
+   putIReg( 4, R_EDI, binop(Iop_Add32, mkexpr(td), mkexpr(t_inc)) );
+}
+
+static 
+void dis_CMPS ( Int sz, IRTemp t_inc )
+{
+   IRType ty  = szToITy(sz);
+   IRTemp tdv = newTemp(ty);      /* (EDI) */
+   IRTemp tsv = newTemp(ty);      /* (ESI) */
+   IRTemp td  = newTemp(Ity_I32); /*  EDI  */
+   IRTemp ts  = newTemp(Ity_I32); /*  ESI  */
+
+   assign( td, getIReg(4, R_EDI) );
+   assign( ts, getIReg(4, R_ESI) );
+
+   assign( tdv, loadRealLE(ty,R_ES,mkexpr(td)) );
+   assign( tsv, loadRealLE(ty,R_DS,mkexpr(ts)) );
+
+   setFlags_DEP1_DEP2 ( Iop_Sub8, tsv, tdv, ty );
+
+   putIReg(4, R_EDI, binop(Iop_Add32, mkexpr(td), mkexpr(t_inc)) );
+   putIReg(4, R_ESI, binop(Iop_Add32, mkexpr(ts), mkexpr(t_inc)) );
+}
+
+static 
+void dis_SCAS ( Int sz, IRTemp t_inc )
+{
+   IRType ty  = szToITy(sz);
+   IRTemp ta  = newTemp(ty);       /*  EAX  */
+   IRTemp td  = newTemp(Ity_I32);  /*  EDI  */
+   IRTemp tdv = newTemp(ty);       /* (EDI) */
+
+   assign( ta, getIReg(sz, R_EAX) );
+   assign( td, getIReg(4, R_EDI) );
+
+   assign( tdv, loadRealLE(ty,R_ES,mkexpr(td)) );
+   setFlags_DEP1_DEP2 ( Iop_Sub8, ta, tdv, ty );
+
+   putIReg(4, R_EDI, binop(Iop_Add32, mkexpr(td), mkexpr(t_inc)) );
+}
+
+
+/* Wrap the appropriate string op inside a REP/REPE/REPNE.
+   We assume the insn is the last one in the basic block, and so emit a jump
+   to the next insn, rather than just falling through. */
+static 
+void dis_REP_op ( /*MOD*/DisResult* dres,
+                  X86Condcode cond,
+                  void (*dis_OP)(Int, IRTemp),
+                  Int sz, Addr32 eip, Addr32 eip_next, const HChar* name )
+{
+   IRTemp t_inc = newTemp(Ity_I32);
+   IRTemp tc    = newTemp(Ity_I32);  /*  ECX  */
+
+   assign( tc, getIReg(4,R_ECX) );
+
+   stmt( IRStmt_Exit( binop(Iop_CmpEQ32,mkexpr(tc),mkU32(0)),
+                      Ijk_Boring,
+                      IRConst_U32(eip_next), OFFB_EIP ) );
+
+   putIReg(4, R_ECX, binop(Iop_Sub32, mkexpr(tc), mkU32(1)) );
+
+   dis_string_op_increment(sz, t_inc);
+   dis_OP (sz, t_inc);
+
+   if (cond == X86CondAlways) {
+      jmp_lit(dres, Ijk_Boring, eip);
+      vassert(dres->whatNext == Dis_StopHere);
+   } else {
+      stmt( IRStmt_Exit( mk_x86g_calculate_condition(cond),
+                         Ijk_Boring,
+                         IRConst_U32(eip), OFFB_EIP ) );
+      jmp_lit(dres, Ijk_Boring, eip_next);
+      vassert(dres->whatNext == Dis_StopHere);
+   }
+   DIP("%s%c\n", name, nameISize(sz));
+}
+
+
+
+static UInt lengthAMode ( Int delta )
+{
+    UChar mod_reg_rm = getIByte(delta); delta++;
+
+   /* squeeze out the reg field from mod_reg_rm, since a 256-entry
+      jump table seems a bit excessive. 
+   */
+   mod_reg_rm &= 0xC7;               /* is now XX000YYY */
+   mod_reg_rm  = toUChar(mod_reg_rm | (mod_reg_rm >> 3));  
+                                     /* is now XX0XXYYY */
+   mod_reg_rm &= 0x1F;               /* is now 000XXYYY */
+   switch (mod_reg_rm) {
+
+      case 0x00: case 0x01: case 0x02: case 0x03:
+      case 0x04: case 0x05: /* ! 06 */ case 0x07:
+      return 1;
+      case 0x08: case 0x09: case 0x0a: case 0x0b:
+      case 0x0c: case 0x0d: case 0x0e: case 0x0f:
+      return 2;
+      case 0x10: case 0x11: case 0x12: case 0x13:
+      case 0x14: case 0x15: case 0x16: case 0x17:
+      case 0x06:
+      return 3;
+      case 0x18: case 0x19: case 0x1a: case 0x1b:
+      case 0x1c: case 0x1d: case 0x1e: case 0x1f:
+      return 1;
+      default:
+         vpanic("lengthAMode16");
+         return 0; /*notreached*/
+   }
+}
+
+
+/*------------------------------------------------------------*/
+/*--- Arithmetic, etc.                                     ---*/
+/*------------------------------------------------------------*/
+
+/* IMUL E, G.  Supplied eip points to the modR/M byte. */
+static
+UInt dis_mul_E_G ( UChar       sorb,
+                   Int         size, 
+                   Int         delta0 )
+{
+   Int    alen;
+   HChar  dis_buf[50];
+   UChar  rm = getIByte(delta0);
+   IRType ty = szToITy(size);
+   IRTemp te = newTemp(ty);
+   IRTemp tg = newTemp(ty);
+   IRTemp resLo = newTemp(ty);
+
+   assign( tg, getIReg(size, gregOfRM(rm)) );
+   if (epartIsReg(rm)) {
+      assign( te, getIReg(size, eregOfRM(rm)) );
+   } else {
+      IRTemp addr = disAMode( &alen, &sorb, delta0, dis_buf );
+      assign( te, loadRealLE(ty,sorb,mkexpr(addr)) );
+   }
+
+   setFlags_MUL ( ty, te, tg, X86G_CC_OP_SMULB );
+
+   assign( resLo, binop( mkSizedOp(ty, Iop_Mul8), mkexpr(te), mkexpr(tg) ) );
+
+   putIReg(size, gregOfRM(rm), mkexpr(resLo) );
+
+   if (epartIsReg(rm)) {
+      DIP("imul%c %s, %s\n", nameISize(size), 
+                             nameIReg(size,eregOfRM(rm)),
+                             nameIReg(size,gregOfRM(rm)));
+      return 1+delta0;
+   } else {
+      DIP("imul%c %s, %s\n", nameISize(size), 
+                             dis_buf, nameIReg(size,gregOfRM(rm)));
+      return alen+delta0;
+   }
 }
 
 
@@ -2380,6 +3034,74 @@ UInt dis_imul_I_E_G ( UChar       sorb,
 }
 
 static 
+void codegen_xchg_eAX_Reg ( Int sz, Int reg )
+{
+   IRType ty = szToITy(sz);
+   IRTemp t1 = newTemp(ty);
+   IRTemp t2 = newTemp(ty);
+   vassert(sz == 2 || sz == 4);
+   assign( t1, getIReg(sz, R_EAX) );
+   assign( t2, getIReg(sz, reg) );
+   putIReg( sz, R_EAX, mkexpr(t2) );
+   putIReg( sz, reg, mkexpr(t1) );
+   DIP("xchg%c %s, %s\n", 
+       nameISize(sz), nameIReg(sz, R_EAX), nameIReg(sz, reg));
+}
+
+static 
+void codegen_SAHF ( void )
+{
+   /* Set the flags to:
+      (x86g_calculate_flags_all() & X86G_CC_MASK_O)  -- retain the old O flag
+      | (%AH & (X86G_CC_MASK_S|X86G_CC_MASK_Z|X86G_CC_MASK_A
+                |X86G_CC_MASK_P|X86G_CC_MASK_C)
+   */
+   UInt   mask_SZACP = X86G_CC_MASK_S|X86G_CC_MASK_Z|X86G_CC_MASK_A
+                       |X86G_CC_MASK_C|X86G_CC_MASK_P;
+   IRTemp oldflags   = newTemp(Ity_I32);
+   assign( oldflags, mk_x86g_calculate_eflags_all() );
+   stmt( IRStmt_Put( OFFB_CC_OP,   mkU32(X86G_CC_OP_COPY) ));
+   stmt( IRStmt_Put( OFFB_CC_NDEP, mkU32(0) ));
+   stmt( IRStmt_Put( OFFB_CC_DEP2, mkU32(0) ));
+   stmt( IRStmt_Put( OFFB_CC_DEP1,
+         binop(Iop_Or32,
+               binop(Iop_And32, mkexpr(oldflags), mkU32(X86G_CC_MASK_O)),
+               binop(Iop_And32, 
+                     binop(Iop_Shr32, getIReg(4, R_EAX), mkU8(8)),
+                     mkU32(mask_SZACP))
+              )
+   ));
+   /* Set NDEP even though it isn't used.  This makes redundant-PUT
+      elimination of previous stores to this field work better. */
+   stmt( IRStmt_Put( OFFB_CC_NDEP, mkU32(0) ));
+}
+
+
+static 
+void codegen_LAHF ( void  )
+{
+   /* AH <- EFLAGS(SF:ZF:0:AF:0:PF:1:CF) */
+   IRExpr* eax_with_hole;
+   IRExpr* new_byte;
+   IRExpr* new_eax;
+   UInt    mask_SZACP = X86G_CC_MASK_S|X86G_CC_MASK_Z|X86G_CC_MASK_A
+                        |X86G_CC_MASK_C|X86G_CC_MASK_P;
+
+   IRTemp  flags = newTemp(Ity_I32);
+   assign( flags, mk_x86g_calculate_eflags_all() );
+
+   eax_with_hole 
+      = binop(Iop_And32, getIReg(4, R_EAX), mkU32(0xFFFF00FF));
+   new_byte 
+      = binop(Iop_Or32, binop(Iop_And32, mkexpr(flags), mkU32(mask_SZACP)),
+                        mkU32(1<<1));
+   new_eax 
+      = binop(Iop_Or32, eax_with_hole,
+                        binop(Iop_Shl32, new_byte, mkU8(8)));
+   putIReg(4, R_EAX, new_eax);
+}
+
+static 
 void dis_push_segreg ( UInt sreg, Int sz )
 {
     IRTemp t1 = newTemp(Ity_I16);
@@ -2410,6 +3132,135 @@ void dis_pop_segreg ( UInt sreg, Int sz )
     DIP("pop%c %s\n", sz==2 ? 'w' : 'l', nameSReg(sreg));
 }
 
+/* Helper for deciding whether a given insn (starting at the opcode
+   byte) may validly be used with a LOCK prefix.  The following insns
+   may be used with LOCK when their destination operand is in memory.
+   AFAICS this is exactly the same for both 32-bit and 64-bit mode.
+
+   ADD        80 /0,  81 /0,  82 /0,  83 /0,  00,  01
+   OR         80 /1,  81 /1,  82 /x,  83 /1,  08,  09
+   ADC        80 /2,  81 /2,  82 /2,  83 /2,  10,  11
+   SBB        81 /3,  81 /3,  82 /x,  83 /3,  18,  19
+   AND        80 /4,  81 /4,  82 /x,  83 /4,  20,  21
+   SUB        80 /5,  81 /5,  82 /x,  83 /5,  28,  29
+   XOR        80 /6,  81 /6,  82 /x,  83 /6,  30,  31
+
+   DEC        FE /1,  FF /1
+   INC        FE /0,  FF /0
+
+   NEG        F6 /3,  F7 /3
+   NOT        F6 /2,  F7 /2
+
+   XCHG       86, 87
+
+   BTC        0F BB,  0F BA /7
+   BTR        0F B3,  0F BA /6
+   BTS        0F AB,  0F BA /5
+
+   CMPXCHG    0F B0,  0F B1
+   CMPXCHG8B  0F C7 /1
+
+   XADD       0F C0,  0F C1
+
+   ------------------------------
+
+   80 /0  =  addb $imm8,  rm8
+   81 /0  =  addl $imm32, rm32  and  addw $imm16, rm16
+   82 /0  =  addb $imm8,  rm8
+   83 /0  =  addl $simm8, rm32  and  addw $simm8, rm16
+
+   00     =  addb r8,  rm8
+   01     =  addl r32, rm32  and  addw r16, rm16
+
+   Same for ADD OR ADC SBB AND SUB XOR
+
+   FE /1  = dec rm8
+   FF /1  = dec rm32  and  dec rm16
+
+   FE /0  = inc rm8
+   FF /0  = inc rm32  and  inc rm16
+
+   F6 /3  = neg rm8
+   F7 /3  = neg rm32  and  neg rm16
+
+   F6 /2  = not rm8
+   F7 /2  = not rm32  and  not rm16
+
+   0F BB     = btcw r16, rm16    and  btcl r32, rm32
+   OF BA /7  = btcw $imm8, rm16  and  btcw $imm8, rm32
+
+   Same for BTS, BTR
+*/
+static Bool can_be_used_with_LOCK_prefix ( const UChar* opc )
+{
+   switch (opc[0]) {
+      case 0x00: case 0x01: case 0x08: case 0x09:
+      case 0x10: case 0x11: case 0x18: case 0x19:
+      case 0x20: case 0x21: case 0x28: case 0x29:
+      case 0x30: case 0x31:
+         if (!epartIsReg(opc[1]))
+            return True;
+         break;
+
+      case 0x80: case 0x81: case 0x82: case 0x83:
+         if (gregOfRM(opc[1]) >= 0 && gregOfRM(opc[1]) <= 6
+             && !epartIsReg(opc[1]))
+            return True;
+         break;
+
+      case 0xFE: case 0xFF:
+         if (gregOfRM(opc[1]) >= 0 && gregOfRM(opc[1]) <= 1
+             && !epartIsReg(opc[1]))
+            return True;
+         break;
+
+      case 0xF6: case 0xF7:
+         if (gregOfRM(opc[1]) >= 2 && gregOfRM(opc[1]) <= 3
+             && !epartIsReg(opc[1]))
+            return True;
+         break;
+
+      case 0x86: case 0x87:
+         if (!epartIsReg(opc[1]))
+            return True;
+         break;
+
+      case 0x0F: {
+         switch (opc[1]) {
+            case 0xBB: case 0xB3: case 0xAB:
+               if (!epartIsReg(opc[2]))
+                  return True;
+               break;
+            case 0xBA: 
+               if (gregOfRM(opc[2]) >= 5 && gregOfRM(opc[2]) <= 7
+                   && !epartIsReg(opc[2]))
+                  return True;
+               break;
+            case 0xB0: case 0xB1:
+               if (!epartIsReg(opc[2]))
+                  return True;
+               break;
+            case 0xC7: 
+               if (gregOfRM(opc[2]) == 1 && !epartIsReg(opc[2]) )
+                  return True;
+               break;
+            case 0xC0: case 0xC1:
+               if (!epartIsReg(opc[2]))
+                  return True;
+               break;
+            default:
+               break;
+         } /* switch (opc[1]) */
+         break;
+      }
+
+      default:
+         break;
+   } /* switch (opc[0]) */
+
+   return False;
+}
+
 
 static
 void dis_ret ( /*MOD*/DisResult* dres, UInt d32, Bool is_far )
@@ -2418,10 +3269,10 @@ void dis_ret ( /*MOD*/DisResult* dres, UInt d32, Bool is_far )
     IRTemp tIP = newTemp(Ity_I16);
     IRTemp tCS_IP = newTemp(Ity_I32);
     IRTemp tCS = newTemp(Ity_I16);;
-    assign(tSP, gtetIReg(2, R_ESP));
-    assign(tIP, loadRealLE(Ity_I16,R_SS,mkexpr(tSP),0));
+    assign(tSP, getIReg(2, R_ESP));
+    assign(tIP, loadRealLE(Ity_I16,R_SS,mkexpr(tSP)));
     if (is_far){
-      assign(tCS, loadRealLE(Ity_I16, R_SS ,binop(Iop_Add16,mkexpr(tSP),mkU16(2)), 0 ));
+      assign(tCS, loadRealLE(Ity_I16, R_SS ,binop(Iop_Add16,mkexpr(tSP),mkU16(2))));
       putSReg(R_CS, mkexpr(tCS));
     }
     else {
@@ -2433,14 +3284,6 @@ void dis_ret ( /*MOD*/DisResult* dres, UInt d32, Bool is_far )
     vassert(dres->whatNext == Dis_StopHere);
 }
 
-static
-UInt fix_ip(UInt Eip){
-   UInt ip = Eip - (guest_CS_bbstart << SEG_SHIFT);
-   vassert((Int)ip >= 0);
-   ip &= 0xffff;
-
-   return (ip + (guest_CS_bbstart << SEG_SHIFT));
-}
 
 /*------------------------------------------------------------*/
 /*--- Disassemble a single instruction                     ---*/
@@ -2624,9 +3467,9 @@ DisResult disInstr_8086_WRK (
       t4 = newTemp(Ity_I16); /* new EFLAGS */
       t5 = newTemp(Ity_I32); /* real return address */
       assign(t1, getIReg(2, R_ESP));
-      assign(t2, loadRealLE(Ity_I16, R_SS, binop(Iop_Add16,mkexpr(t1),mkU32(0)), 0));
-      assign(t3, loadRealLE(Ity_I16, R_SS, binop(Iop_Add16,mkexpr(t1),mkU32(2)), 0));
-      assign(t4, loadRealLE(Ity_I16, R_SS, binop(Iop_Add16,mkexpr(t1),mkU32(4)), 0));
+      assign(t2, loadRealLE(Ity_I16, R_SS, binop(Iop_Add16,mkexpr(t1),mkU32(0))));
+      assign(t3, loadRealLE(Ity_I16, R_SS, binop(Iop_Add16,mkexpr(t1),mkU32(2))));
+      assign(t4, loadRealLE(Ity_I16, R_SS, binop(Iop_Add16,mkexpr(t1),mkU32(4))));
       /* Get stuff off stack */
       putIReg(2, R_ESP,binop(Iop_Add16, mkexpr(t1), mkU32(6)));
       /* set %CS (which is ignored anyway) */
@@ -2651,8 +3494,8 @@ DisResult disInstr_8086_WRK (
       assign(t2, binop(Iop_Sub16, mkexpr(t1), mkU16(2)));
       assign(t3, binop(Iop_Sub16, mkexpr(t1), mkU16(4)));
 
-      storeRealLE( mkexpr(t2), R_SS , getSReg(R_CS),0);
-      storeRealLE( mkexpr(t3), R_SS , mkU16(guest_EIP_bbstart+delta),0);
+      storeRealLE( mkexpr(t2), R_SS , getSReg(R_CS));
+      storeRealLE( mkexpr(t3), R_SS , mkU16(guest_EIP_bbstart+delta));
       
       putIReg(2, R_ESP, mkexpr(t3));
       assign(t4, realAddr(mkU16(c32),mkU16(d32)));
@@ -2672,7 +3515,7 @@ DisResult disInstr_8086_WRK (
        t1 = newTemp(Ity_I16); 
          assign(t1, binop(Iop_Sub32, getIReg(2,R_ESP), mkU32(2)));
          putIReg(2, R_ESP, mkexpr(t1));
-         storeRealLE( mkexpr(t1), R_SS, mkU32(guest_EIP_bbstart+delta), 0);
+         storeRealLE( mkexpr(t1), R_SS, mkU32(guest_EIP_bbstart+delta));
          if (resteerOkFn( callback_opaque, (Addr32)d32 )) {
             /* follow into the call target. */
             dres.whatNext   = Dis_ResteerU;
@@ -2712,7 +3555,7 @@ DisResult disInstr_8086_WRK (
       /* First PUT ESP looks redundant, but need it because ESP must
          always be up-to-date for Memcheck to work... */
       putIReg(2, R_ESP, mkexpr(t1));
-      assign(t2, loadRealLE(Ity_I16,R_SS,mkexpr(t1), 0));
+      assign(t2, loadRealLE(Ity_I16,R_SS,mkexpr(t1)));
       putIReg(2, R_EBP, mkexpr(t2));
       putIReg(2, R_ESP, binop(Iop_Add16, mkexpr(t1), mkU16(2)) );
       DIP("leave\n");
@@ -3177,7 +4020,8 @@ DisResult disInstr_8086_WRK (
       /* NOTE!  this is the one place where a segment override prefix
          has no effect on the address calculation.  Therefore we pass
          zero instead of sorb here. */
-      addr = disAMode ( &alen, /*sorb*/ -1, delta, dis_buf );
+      sorb = -1; /* no sorb for lea! */
+      addr = disAMode ( &alen, &sorb, delta, dis_buf );
       delta += alen;
       putIReg(2, gregOfRM(modrm), mkexpr(addr));
       DIP("lea%c %s, %s\n", nameISize(sz), dis_buf, 
@@ -4533,19 +5377,19 @@ DisResult disInstr_8086 ( IRSB*        irsb_IN,
    expect_CAS = False;
 	
    ignore_seg_mode = archinfo->i8086_ignore_seg_mode;
-   if((archinfo->i8086_cs_reg & UNSET_SEG_REG == 0))
+   if((archinfo->i8086_cs_reg & UNINITALIZED_SREG == 0))
    {
       putSReg(R_CS, mkU16(archinfo->i8086_cs_reg & 0xffff));
    }
-   if((archinfo->i8086_ds_reg & UNSET_SEG_REG == 0))
+   if((archinfo->i8086_ds_reg & UNINITALIZED_SREG == 0))
    {
       putSReg(R_DS, mkU16(archinfo->i8086_ds_reg & 0xffff));
    }
-   if((archinfo->i8086_es_reg & UNSET_SEG_REG == 0))
+   if((archinfo->i8086_es_reg & UNINITALIZED_SREG == 0))
    {
       putSReg(R_ES, mkU16(archinfo->i8086_es_reg & 0xffff));
    }
-   if((archinfo->i8086_ss_reg & UNSET_SEG_REG == 0))
+   if((archinfo->i8086_ss_reg & UNINITALIZED_SREG == 0))
    {
       putSReg(R_SS, mkU16(archinfo->i8086_ss_reg & 0xffff));
    }

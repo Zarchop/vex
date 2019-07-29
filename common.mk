@@ -88,6 +88,7 @@ NORMAL_OBJS = \
 	priv/guest_s390_helpers.o	\
 	priv/guest_mips_helpers.o	\
 	priv/guest_x86_toIR.o		\
+	priv/guest_8086_toIR.o      \
 	priv/guest_amd64_toIR.o		\
 	priv/guest_arm_toIR.o		\
 	priv/guest_arm64_toIR.o		\
