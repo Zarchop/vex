@@ -561,7 +561,24 @@ IRSB *LibVEX_Lift (  VexTranslateArgs *vta,
          vassert(sizeof( ((VexGuestTILEGXState*)0)->guest_CMLEN      ) == 8);
          vassert(sizeof( ((VexGuestTILEGXState*)0)->guest_NRADDR     ) == 8);
          break;
-
+         
+      case VexArch8086:
+         preciseMemExnsFn       
+            = X86FN(guest_x86_state_requires_precise_mem_exns);
+         disInstrFn              = X86FN(disInstr_8086);
+         specHelper              = X86FN(guest_x86_spechelper);
+         guest_layout            = X86FN(&x86guest_layout);
+         offB_CMSTART            = offsetof(VexGuestX86State,guest_CMSTART);
+         offB_CMLEN              = offsetof(VexGuestX86State,guest_CMLEN);
+         offB_GUEST_IP           = offsetof(VexGuestX86State,guest_EIP);
+         szB_GUEST_IP            = sizeof( ((VexGuestX86State*)0)->guest_EIP );
+         vassert(vta->archinfo_guest.endness == VexEndnessLE);
+         vassert(0 == sizeof(VexGuestX86State) % LibVEX_GUEST_STATE_ALIGN);
+         vassert(sizeof( ((VexGuestX86State*)0)->guest_CMSTART) == 4);
+         vassert(sizeof( ((VexGuestX86State*)0)->guest_CMLEN  ) == 4);
+         vassert(sizeof( ((VexGuestX86State*)0)->guest_NRADDR ) == 4);
+         break;
+         
       default:
          vpanic("LibVEX_Translate: unsupported guest insn set");
    }
