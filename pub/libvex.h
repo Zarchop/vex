@@ -334,6 +334,10 @@ typedef
       /* 8086 angr specific mode - causes processor to ignore implcit use
        * of segmentation registers */
       UInt i8086_ignore_seg_mode;
+      UInt i8086_cs_reg;
+      UInt i8086_ds_reg;
+      UInt i8086_es_reg;
+      UInt i8086_ss_reg;
    }
    VexArchInfo;
 
