@@ -69,49 +69,58 @@ static Bool ignore_seg_mode;
 /*------------------------------------------------------------*/
 /*--- Offsets of various parts of the x86 guest state.     ---*/
 /*------------------------------------------------------------*/
-/*------------------------------------------------------------*/
-/*--- Offsets of various parts of the x86 guest state.     ---*/
-/*------------------------------------------------------------*/
 
-#define OFFB_EAX       offsetof(VexGuest8086State,guest_EAX)
-#define OFFB_EBX       offsetof(VexGuest8086State,guest_EBX)
-#define OFFB_ECX       offsetof(VexGuest8086State,guest_ECX)
-#define OFFB_EDX       offsetof(VexGuest8086State,guest_EDX)
-#define OFFB_ESP       offsetof(VexGuest8086State,guest_ESP)
-#define OFFB_EBP       offsetof(VexGuest8086State,guest_EBP)
-#define OFFB_ESI       offsetof(VexGuest8086State,guest_ESI)
-#define OFFB_EDI       offsetof(VexGuest8086State,guest_EDI)
+#define OFFB_EAX       offsetof(VexGuestX86State,guest_EAX)
+#define OFFB_EBX       offsetof(VexGuestX86State,guest_EBX)
+#define OFFB_ECX       offsetof(VexGuestX86State,guest_ECX)
+#define OFFB_EDX       offsetof(VexGuestX86State,guest_EDX)
+#define OFFB_ESP       offsetof(VexGuestX86State,guest_ESP)
+#define OFFB_EBP       offsetof(VexGuestX86State,guest_EBP)
+#define OFFB_ESI       offsetof(VexGuestX86State,guest_ESI)
+#define OFFB_EDI       offsetof(VexGuestX86State,guest_EDI)
 
-#define OFFB_EIP       offsetof(VexGuest8086State,guest_EIP)
+#define OFFB_EIP       offsetof(VexGuestX86State,guest_EIP)
 
-#define OFFB_CC_OP     offsetof(VexGuest8086State,guest_CC_OP)
-#define OFFB_CC_DEP1   offsetof(VexGuest8086State,guest_CC_DEP1)
-#define OFFB_CC_DEP2   offsetof(VexGuest8086State,guest_CC_DEP2)
-#define OFFB_CC_NDEP   offsetof(VexGuest8086State,guest_CC_NDEP)
+#define OFFB_CC_OP     offsetof(VexGuestX86State,guest_CC_OP)
+#define OFFB_CC_DEP1   offsetof(VexGuestX86State,guest_CC_DEP1)
+#define OFFB_CC_DEP2   offsetof(VexGuestX86State,guest_CC_DEP2)
+#define OFFB_CC_NDEP   offsetof(VexGuestX86State,guest_CC_NDEP)
 
-#define OFFB_FPREGS    offsetof(VexGuest8086State,guest_FPREG[0])
-#define OFFB_FPTAGS    offsetof(VexGuest8086State,guest_FPTAG[0])
-#define OFFB_DFLAG     offsetof(VexGuest8086State,guest_DFLAG)
-#define OFFB_IDFLAG    offsetof(VexGuest8086State,guest_IDFLAG)
-#define OFFB_ACFLAG    offsetof(VexGuest8086State,guest_ACFLAG)
-#define OFFB_FTOP      offsetof(VexGuest8086State,guest_FTOP)
-#define OFFB_FC3210    offsetof(VexGuest8086State,guest_FC3210)
-#define OFFB_FPROUND   offsetof(VexGuest8086State,guest_FPROUND)
+#define OFFB_FPREGS    offsetof(VexGuestX86State,guest_FPREG[0])
+#define OFFB_FPTAGS    offsetof(VexGuestX86State,guest_FPTAG[0])
+#define OFFB_DFLAG     offsetof(VexGuestX86State,guest_DFLAG)
+#define OFFB_IDFLAG    offsetof(VexGuestX86State,guest_IDFLAG)
+#define OFFB_ACFLAG    offsetof(VexGuestX86State,guest_ACFLAG)
+#define OFFB_FTOP      offsetof(VexGuestX86State,guest_FTOP)
+#define OFFB_FC3210    offsetof(VexGuestX86State,guest_FC3210)
+#define OFFB_FPROUND   offsetof(VexGuestX86State,guest_FPROUND)
 
-#define OFFB_CS        offsetof(VexGuest8086State,guest_CS)
-#define OFFB_DS        offsetof(VexGuest8086State,guest_DS)
-#define OFFB_ES        offsetof(VexGuest8086State,guest_ES)
-#define OFFB_FS        offsetof(VexGuest8086State,guest_FS)
-#define OFFB_GS        offsetof(VexGuest8086State,guest_GS)
-#define OFFB_SS        offsetof(VexGuest8086State,guest_SS)
+#define OFFB_CS        offsetof(VexGuestX86State,guest_CS)
+#define OFFB_DS        offsetof(VexGuestX86State,guest_DS)
+#define OFFB_ES        offsetof(VexGuestX86State,guest_ES)
+#define OFFB_FS        offsetof(VexGuestX86State,guest_FS)
+#define OFFB_GS        offsetof(VexGuestX86State,guest_GS)
+#define OFFB_SS        offsetof(VexGuestX86State,guest_SS)
+#define OFFB_LDT       offsetof(VexGuestX86State,guest_LDT)
+#define OFFB_GDT       offsetof(VexGuestX86State,guest_GDT)
 
-#define OFFB_EMNOTE    offsetof(VexGuest8086State,guest_EMNOTE)
+#define OFFB_SSEROUND  offsetof(VexGuestX86State,guest_SSEROUND)
+#define OFFB_XMM0      offsetof(VexGuestX86State,guest_XMM0)
+#define OFFB_XMM1      offsetof(VexGuestX86State,guest_XMM1)
+#define OFFB_XMM2      offsetof(VexGuestX86State,guest_XMM2)
+#define OFFB_XMM3      offsetof(VexGuestX86State,guest_XMM3)
+#define OFFB_XMM4      offsetof(VexGuestX86State,guest_XMM4)
+#define OFFB_XMM5      offsetof(VexGuestX86State,guest_XMM5)
+#define OFFB_XMM6      offsetof(VexGuestX86State,guest_XMM6)
+#define OFFB_XMM7      offsetof(VexGuestX86State,guest_XMM7)
 
-#define OFFB_CMSTART   offsetof(VexGuest8086State,guest_CMSTART)
-#define OFFB_CMLEN     offsetof(VexGuest8086State,guest_CMLEN)
-#define OFFB_NRADDR    offsetof(VexGuest8086State,guest_NRADDR)
+#define OFFB_EMNOTE    offsetof(VexGuestX86State,guest_EMNOTE)
 
-#define OFFB_IP_AT_SYSCALL offsetof(VexGuest8086State,guest_IP_AT_SYSCALL)
+#define OFFB_CMSTART   offsetof(VexGuestX86State,guest_CMSTART)
+#define OFFB_CMLEN     offsetof(VexGuestX86State,guest_CMLEN)
+#define OFFB_NRADDR    offsetof(VexGuestX86State,guest_NRADDR)
+
+#define OFFB_IP_AT_SYSCALL offsetof(VexGuestX86State,guest_IP_AT_SYSCALL)
 
 
 /*------------------------------------------------------------*/
