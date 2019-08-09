@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include "libvex_basictypes.h"
 #include "libvex_ir.h"
 #include "libvex.h"
@@ -53,16 +54,19 @@ static Bool ignore_seg_mode;
       vex_sprintf(buf, format, ## args)
 #else
 #define DIP(format, ...)           \
+   printf(format, __VA_ARGS__); \
    if (vex_traceflags & VEX_TRACE_FE)  \
       vex_printf(format, __VA_ARGS__)
 
 #define DIS(buf, format, ...)      \
+   sprintf(buf, format, __VA_ARGS__); \
    if (vex_traceflags & VEX_TRACE_FE)  \
       vex_sprintf(buf, format, __VA_ARGS__)
 #endif
 
 #define UNINITALIZED_SREG (0x80000000)
 #define EXPLICIT_BIT (0x80)
+
 #define IS_EXPLICIT_BIT_SET(sreg) (0x80 & sreg)
 
 /*------------------------------------------------------------*/
@@ -147,6 +151,7 @@ static Bool ignore_seg_mode;
 #define R_DS 3
 #define R_FS 4
 #define R_GS 5
+#define UNDEFINED_SEG 255
 
 /* Add a statement to the list held by "irbb". */
 static void stmt ( IRStmt* st )
@@ -322,12 +327,13 @@ static Int integerGuestRegOffset ( Int sz, UInt archreg )
 
 static Int segmentGuestRegOffset ( UInt sreg )
 {
+   sreg = sreg & ~EXPLICIT_BIT;
    switch (sreg) {
       case R_ES: return OFFB_ES;
       case R_CS: return OFFB_CS;
       case R_SS: return OFFB_SS;
       case R_DS: return OFFB_DS;
-      default: vpanic("segmentGuestRegOffset(x86)");
+      default: vpanic("segmentGuestRegOffset(8086)");
    }
 }
 
@@ -903,12 +909,12 @@ UInt fix_ip(UInt Eip){
 
 static IRExpr* realAddr( IRExpr* segaddr ,IRExpr* addr )
 {
-   return binop(Iop_Add32, unop(Iop_16Uto32, addr), binop(Iop_Shl32, unop(Iop_16Uto32,segaddr), mkU8(SEG_SHIFT)));
+   return binop(Iop_Add32, addr, binop(Iop_Shl32, unop(Iop_16Uto32,segaddr), mkU8(SEG_SHIFT)));
 }
 
 static IRExpr* loadRealLE ( IRType ty, Int sreg , IRExpr* addr)
 {
-   if(( !IS_EXPLICIT_BIT_SET(sreg) && ignore_seg_mode) || sreg == -1){
+   if(( !IS_EXPLICIT_BIT_SET(sreg) && ignore_seg_mode) || sreg == UNDEFINED_SEG){
       return loadLE(ty, addr);
    }
    return loadLE( ty, realAddr(getSReg(sreg), addr ));
@@ -916,7 +922,7 @@ static IRExpr* loadRealLE ( IRType ty, Int sreg , IRExpr* addr)
 
 static void storeRealLE ( IRExpr* addr,Int sreg,  IRExpr* data)
 {
-   if((!IS_EXPLICIT_BIT_SET(sreg) && ignore_seg_mode) || sreg == -1){
+   if((!IS_EXPLICIT_BIT_SET(sreg) && ignore_seg_mode) || sreg == UNDEFINED_SEG){
       storeLE(addr, data);
       return;
    }
@@ -1274,11 +1280,15 @@ const HChar* sorbTxt ( UChar sorb )
 {
    switch (sorb) {
 
-      case (-1):    return ""; /* no override */
-      case R_CS: return "%cs";
-      case R_DS: return "%ds";
-      case R_ES: return "%es:";
-      case R_SS: return "%ss:";
+      case (UNDEFINED_SEG):    return ""; /* no override */
+      case R_CS: return "";
+      case R_DS: return "";
+      case R_ES: return "";
+      case R_SS: return "";
+      case R_CS | EXPLICIT_BIT: return "%cs:";
+      case R_DS | EXPLICIT_BIT: return "%ds:";
+      case R_ES | EXPLICIT_BIT: return "%es:";
+      case R_SS | EXPLICIT_BIT: return "%ss:";
       default: vpanic("sorbTxt(x86,guest)");
    }
 }
@@ -1286,7 +1296,7 @@ const HChar* sorbTxt ( UChar sorb )
 
 static IRTemp disAMode_copy2tmp ( IRExpr* addr32 )
 {
-   IRTemp tmp = newTemp(Ity_I16);
+   IRTemp tmp = newTemp(Ity_I32);
    assign( tmp, addr32 );
    return tmp;
 }
@@ -1308,16 +1318,19 @@ IRTemp disAMode ( Int* len, UChar* sorb, Int delta, HChar* buf ) {
                                             /* is now XX0XXYYY */
    mod_reg_rm &= 0x1F;             /* is now 000XXYYY */
    rm = mod_reg_rm & 0x7;
-   mod = mod_reg_rm >> 6;
-   UInt d;
+   mod = mod_reg_rm >> 3;
+   Int d;
    /* 0x6 is a special case because we can't
     * deref %bp without displacement */
    if(mod_reg_rm == 0x6)
    {
 	 UInt d = getUDisp16(delta);
 	 *len = 3;
+    if((!ignore_seg_mode) && (*sorb == UNDEFINED_SEG)){
+        *sorb = R_DS;
+    }
 	  DIS(buf, "%s(0x%x)", sorbTxt(*sorb), d);
-      return disAMode_copy2tmp(mkU16(d));
+      return disAMode_copy2tmp(mkU32(d));
    }
    switch(mod){
       case 0x00:
@@ -1325,11 +1338,11 @@ IRTemp disAMode ( Int* len, UChar* sorb, Int delta, HChar* buf ) {
 	  *len = 1;
 	  break;
 	  case 0x01:
-	  d = getUChar(delta);
+	  d = getSDisp8(delta);
 	  *len = 2;
 	  break;
 	  case 0x02:
-	  d = getUDisp16(delta);
+	  d = getSDisp16(delta); //TODO is it really signed?
 	  *len = 3;
 	  break;
 	  case 0x03:
@@ -1337,12 +1350,12 @@ IRTemp disAMode ( Int* len, UChar* sorb, Int delta, HChar* buf ) {
    }
    switch (rm){
       case 0x00: case 0x01: case 0x04: case 0x05: case 0x07:
-      if((!ignore_seg_mode) && (*sorb == -1)){
+      if((!ignore_seg_mode) && (*sorb == UNDEFINED_SEG)){
         *sorb = R_DS;
      }
      break;
       case 0x02: case 0x03: case 0x06:
-      if((!ignore_seg_mode) && (*sorb == -1)){
+      if((!ignore_seg_mode) && (*sorb == UNDEFINED_SEG)){
         *sorb = R_SS;
      }
    }
@@ -1350,30 +1363,38 @@ IRTemp disAMode ( Int* len, UChar* sorb, Int delta, HChar* buf ) {
    switch (rm){
 	  case 0x00:
 	  deref_vaddr = binop(Iop_Add16,getIReg(2, R_EBX),getIReg(2, R_ESI));
+     DIS(buf, "%s%d(%%bx, %%si)",sorbTxt(*sorb) ,d);
 	  break;
 	  case 0x01:
 	  deref_vaddr = binop(Iop_Add16,getIReg(2, R_EBX),getIReg(2, R_EDI));
+     DIS(buf, "%s%d(%%bx, %%di)",sorbTxt(*sorb) ,d);
 	  break;
 	  case 0x02:
 	  deref_vaddr = binop(Iop_Add16,getIReg(2, R_EBP),getIReg(2, R_ESI));
+     DIS(buf, "%s%d(%%bp, %%si)",sorbTxt(*sorb) ,d);
 	  break;
 	  case 0x03:
 	  deref_vaddr = binop(Iop_Add16,getIReg(2, R_EBP),getIReg(2, R_EDI));
+     DIS(buf, "%s%d(%%bp, %%di)",sorbTxt(*sorb) ,d);
 	  break;
 	  case 0x04:
 	  deref_vaddr = IRExpr_Get(OFFB_ESI,szToITy(2));
+     DIS(buf, "%s%d(%%si)",sorbTxt(*sorb) ,d);
 	  break;
 	  case 0x05:
 	  deref_vaddr = IRExpr_Get(OFFB_EDI,szToITy(2));
+     DIS(buf, "%s%d(%%di)",sorbTxt(*sorb) ,d);
 	  break;
 	  case 0x06:
 	  deref_vaddr = IRExpr_Get(OFFB_EBP,szToITy(2));
+     DIS(buf, "%s%d(%%bp)",sorbTxt(*sorb) ,d);
 	  break;
 	  case 0x07:
 	  deref_vaddr = IRExpr_Get(OFFB_EBX,szToITy(2));
+     DIS(buf, "%s%d(%%bx)",sorbTxt(*sorb) ,d);
 	  break;
    }
-   return disAMode_copy2tmp(binop(Iop_Add16,deref_vaddr,mkU16(d)));
+   return disAMode_copy2tmp(binop(Iop_Add32,unop(Iop_16Uto32,deref_vaddr),mkU32(d)));
 
 }
 
@@ -1396,7 +1417,7 @@ void dis_string_op( void (*dis_OP)( Int, IRTemp ),
                     Int sz, const HChar* name, UChar sorb )
 {
    IRTemp t_inc = newTemp(Ity_I32);
-   vassert(sorb == 0); /* hmm.  so what was the point of passing it in? */
+   vassert(sorb == UNDEFINED_SEG); /* hmm.  so what was the point of passing it in? */
    dis_string_op_increment(sz, t_inc);
    dis_OP( sz, t_inc );
    DIP("%s%c\n", name, nameISize(sz));
@@ -3338,7 +3359,7 @@ DisResult disInstr_8086_WRK (
    /* sorb holds the segment-override-prefix byte, if any.  Zero if no
       prefix has been seen, else one of {0x26, 0x36, 0x3E, 0x64, 0x65}
       indicating the prefix.  */
-   UChar sorb = -1;
+   UChar sorb = UNDEFINED_SEG;
 
    /* Gets set to True if a LOCK prefix is seen. */
    Bool pfx_lock = False;
@@ -3352,8 +3373,7 @@ DisResult disInstr_8086_WRK (
    *expect_CAS = False;
 
    addr = t0 = t1 = t2 = t3 = t4 = t5 = t6 = IRTemp_INVALID; 
-
-   vassert(guest_EIP_bbstart + delta == guest_EIP_curr_instr);
+   vassert(guest_EIP_bbstart + delta == guest_EIP_curr_instr); // TODO this is not correct in the case of 8086
    DIP("\t0x%x:  ", guest_EIP_bbstart+delta);       
 
    /* Normal instruction handling starts here. */
@@ -3374,17 +3394,17 @@ DisResult disInstr_8086_WRK (
             *expect_CAS = True;
             break;
          case 0x3E: /* %DS: */
-         if (sorb != -1) 
+         if (sorb != UNDEFINED_SEG) 
                goto decode_failure; /* only one seg override allowed */
             sorb = EXPLICIT_BIT | R_DS;
             break;
          case 0x26: /* %ES: */
-         if (sorb != -1) 
+         if (sorb != UNDEFINED_SEG) 
                goto decode_failure; /* only one seg override allowed */
             sorb = EXPLICIT_BIT | R_ES;
             break;
          case 0x36: /* %SS: */
-            if (sorb != -1) 
+            if (sorb != UNDEFINED_SEG) 
                goto decode_failure; /* only one seg override allowed */
             sorb = EXPLICIT_BIT | R_SS;
             break;
@@ -3523,31 +3543,11 @@ DisResult disInstr_8086_WRK (
          } else {
             jmp_lit(&dres, Ijk_Call, d32);
             vassert(dres.whatNext == Dis_StopHere);
+         }
       DIP("call 0x%x\n",d32);
       break;
 
-//--    case 0xC8: /* ENTER */ 
-//--       d32 = getUDisp16(eip); eip += 2;
-//--       abyte = getIByte(delta); delta++;
-//-- 
-//--       vg_assert(sz == 4);           
-//--       vg_assert(abyte == 0);
-//-- 
-//--       t1 = newTemp(cb); t2 = newTemp(cb);
-//--       uInstr2(cb, GET,   sz, ArchReg, R_EBP, TempReg, t1);
-//--       uInstr2(cb, GET,    4, ArchReg, R_ESP, TempReg, t2);
-//--       uInstr2(cb, SUB,    4, Literal, 0,     TempReg, t2);
-//--       uLiteral(cb, sz);
-//--       uInstr2(cb, PUT,    4, TempReg, t2,    ArchReg, R_ESP);
-//--       uInstr2(cb, STORE,  4, TempReg, t1,    TempReg, t2);
-//--       uInstr2(cb, PUT,    4, TempReg, t2,    ArchReg, R_EBP);
-//--       if (d32) {
-//--          uInstr2(cb, SUB,    4, Literal, 0,     TempReg, t2);
-//--          uLiteral(cb, d32);
-//--          uInstr2(cb, PUT,    4, TempReg, t2,    ArchReg, R_ESP);
-//--       }
-//--       DIP("enter 0x%x, 0x%x", d32, abyte);
-//--       break;
+
 
    case 0xC9: /* LEAVE */
       t1 = newTemp(Ity_I16); t2 = newTemp(Ity_I16);
@@ -3557,7 +3557,7 @@ DisResult disInstr_8086_WRK (
       putIReg(2, R_ESP, mkexpr(t1));
       assign(t2, loadRealLE(Ity_I16,R_SS,mkexpr(t1)));
       putIReg(2, R_EBP, mkexpr(t2));
-      putIReg(2, R_ESP, binop(Iop_Add16, mkexpr(t1), mkU16(2)) );
+      putIReg(2, R_ESP, binop(Iop_Add32, mkexpr(t1), mkU16(2)) );
       DIP("leave\n");
       break;
 
@@ -4020,10 +4020,10 @@ DisResult disInstr_8086_WRK (
       /* NOTE!  this is the one place where a segment override prefix
          has no effect on the address calculation.  Therefore we pass
          zero instead of sorb here. */
-      sorb = -1; /* no sorb for lea! */
       addr = disAMode ( &alen, &sorb, delta, dis_buf );
+      sorb = UNDEFINED_SEG; /* no sorb for lea! */
       delta += alen;
-      putIReg(2, gregOfRM(modrm), mkexpr(addr));
+      putIReg(2, gregOfRM(modrm), unop(Iop_32to16,mkexpr(addr)));
       DIP("lea%c %s, %s\n", nameISize(sz), dis_buf, 
                             nameIReg(sz,gregOfRM(modrm)));
       break;
@@ -4042,7 +4042,7 @@ DisResult disInstr_8086_WRK (
    case 0xA1: /* MOV Ov,eAX */
       d32 = getUDisp16(delta); delta += 2;
       ty = szToITy(sz);
-      if (sorb == -1){
+      if (sorb == UNDEFINED_SEG){
          sorb = R_DS;
       }
       putIReg(sz, R_EAX, loadRealLE(ty, sorb, mkU16(d32)));
@@ -4056,7 +4056,7 @@ DisResult disInstr_8086_WRK (
    case 0xA3: /* MOV eAX,Ov */
       d32 = getUDisp16(delta); delta += 2;
       ty = szToITy(sz);
-      if (sorb == -1){
+      if (sorb == UNDEFINED_SEG){
          sorb = R_DS;
       }
       storeRealLE( mkexpr(addr),sorb , getIReg(sz,R_EAX) );
@@ -4559,35 +4559,35 @@ DisResult disInstr_8086_WRK (
 
    case 0xA4: /* MOVS, no REP prefix */
    case 0xA5: 
-      if (sorb != -1)
+      if (sorb != UNDEFINED_SEG)
          goto decode_failure; /* else dis_string_op asserts */
       dis_string_op( dis_MOVS, ( opc == 0xA4 ? 1 : sz ), "movs", sorb );
       break;
 
   case 0xA6: /* CMPSb, no REP prefix */
   case 0xA7:
-      if (sorb != -1)
+      if (sorb != UNDEFINED_SEG)
          goto decode_failure; /* else dis_string_op asserts */
       dis_string_op( dis_CMPS, ( opc == 0xA6 ? 1 : sz ), "cmps", sorb );
       break;
 
    case 0xAA: /* STOS, no REP prefix */
    case 0xAB:
-      if (sorb != -1)
+      if (sorb != UNDEFINED_SEG)
          goto decode_failure; /* else dis_string_op asserts */
       dis_string_op( dis_STOS, ( opc == 0xAA ? 1 : sz ), "stos", sorb );
       break;
 
    case 0xAC: /* LODS, no REP prefix */
    case 0xAD:
-      if (sorb != -1)
+      if (sorb != UNDEFINED_SEG)
          goto decode_failure; /* else dis_string_op asserts */
       dis_string_op( dis_LODS, ( opc == 0xAC ? 1 : sz ), "lods", sorb );
       break;
 
    case 0xAE: /* SCAS, no REP prefix */
    case 0xAF:
-      if (sorb != -1) 
+      if (sorb != UNDEFINED_SEG) 
          goto decode_failure; /* else dis_string_op asserts */
       dis_string_op( dis_SCAS, ( opc == 0xAE ? 1 : sz ), "scas", sorb );
       break;
@@ -4652,7 +4652,7 @@ DisResult disInstr_8086_WRK (
    /* REPNE prefix insn */
    case 0xF2: { 
       Addr32 eip_orig = fix_ip(guest_EIP_bbstart + delta_start);
-      if (sorb != -1) goto decode_failure;
+      if (sorb != UNDEFINED_SEG) goto decode_failure;
       abyte = getIByte(delta); delta++;
       Addr32 eip_next=fix_ip(guest_EIP_bbstart+delta);
       
@@ -4702,7 +4702,7 @@ DisResult disInstr_8086_WRK (
       abyte = getIByte(delta); delta++;
       Addr32 eip_next=fix_ip(guest_EIP_bbstart+delta);
 
-      if (sorb != -1) goto decode_failure;
+      if (sorb != UNDEFINED_SEG) goto decode_failure;
 
       switch (abyte) {
       case 0xA4: sz = 1;   /* REP MOVS<sz> */
@@ -4791,7 +4791,7 @@ DisResult disInstr_8086_WRK (
    /* ------------------------ XLAT ----------------------- */
 
    case 0xD7: /* XLAT */
-      if(sorb == -1){
+      if(sorb == UNDEFINED_SEG){
          sorb = R_DS;
       }
       putIReg(1,R_EAX/*AL*/,loadRealLE(Ity_I8, sorb, binop(Iop_Add32, getIReg(4, R_EBX), unop(Iop_8Uto32, getIReg(1, R_EAX/*AL*/)))));
@@ -5336,10 +5336,9 @@ DisResult disInstr_8086_WRK (
    DIP("\n");
    dres.len = delta - delta_start;
    return dres;
-}}
+}
 
-#undef DIP
-#undef DIS
+
 
 /*------------------------------------------------------------*/
 /*--- Top-level fn                                         ---*/
@@ -5364,9 +5363,8 @@ DisResult disInstr_8086 ( IRSB*        irsb_IN,
    Int       i, x1, x2;
    Bool      expect_CAS, has_CAS;
    DisResult dres;
-
    /* Set globals (see top of this file) */
-   vassert(guest_arch == VexArchX86);
+   vassert(guest_arch == VexArch8086);
    guest_code           = guest_code_IN;
    irsb                 = irsb_IN;
    host_endness         = host_endness_IN;
@@ -5427,10 +5425,10 @@ DisResult disInstr_8086 ( IRSB*        irsb_IN,
          disInstr. */
       vpanic("disInstr_X86: inconsistency in LOCK prefix handling");
    }
-
    return dres;
 }
-
+#undef DIP
+#undef DIS
 
 /*--------------------------------------------------------------------*/
 /*--- end                                         guest_8086_toIR.c ---*/

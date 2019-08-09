@@ -33,6 +33,8 @@
    without prior written permission.
 */
 
+#include <stdio.h>
+
 #include "libvex_basictypes.h"
 #include "libvex.h"
 
@@ -227,6 +229,8 @@ void vex_assert_fail ( const HChar* expr,
 __attribute__ ((noreturn))
 void vpanic ( const HChar* str )
 {
+   printf("\r\nvex: the `impossible' happened:\r\n   %s\r\n", str);
+   fflush(stdout);
    vex_printf("\nvex: the `impossible' happened:\n   %s\n", str);
    (*vex_failure_exit)();
 }
@@ -532,7 +536,7 @@ UInt vex_printf ( const HChar* format, ... )
    UInt ret;
    va_list vargs;
    va_start(vargs, format);
-   ret = vex_vprintf(format, vargs);
+   ret = printf(format, vargs); /* todo revert back */
    va_end(vargs);
 
    return ret;

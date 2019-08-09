@@ -369,7 +369,6 @@ IRSB *LibVEX_Lift (  VexTranslateArgs *vta,
    offB_CMLEN              = 0;
    offB_GUEST_IP           = 0;
    szB_GUEST_IP            = 0;
-
    vassert(vex_initdone);
    vassert(vta->needs_self_check  != NULL);
 
@@ -586,6 +585,7 @@ IRSB *LibVEX_Lift (  VexTranslateArgs *vta,
    // Are the guest's hardware capabilities feasible. The function will
    // not return if hwcaps are infeasible in some sense.
    // FIXME: how can we know the guest's hardware capabilities?
+
    check_hwcaps(vta->arch_guest, vta->archinfo_guest.hwcaps);
 
    res->status         = VexTransOK;
@@ -1578,6 +1578,7 @@ void LibVEX_default_VexAbiInfo ( /*OUT*/VexAbiInfo* vbi )
 
 static IRType arch_word_size (VexArch arch) {
    switch (arch) {
+      case VexArch8086:
       case VexArchX86:
       case VexArchARM:
       case VexArchMIPS32:
@@ -1944,7 +1945,9 @@ static void check_hwcaps ( VexArch arch, UInt hwcaps )
          }
          invalid_hwcaps(arch, hwcaps, "Cannot handle capabilities\n");
       }
-
+      case VexArch8086:
+         if (hwcaps == 0) return;
+         invalid_hwcaps(arch, hwcaps, "Cannot handle capabilities\n");
       case VexArchAMD64: {
          /* SSE3 and CX16 are orthogonal and > baseline, although we really
             don't expect to come across anything which can do SSE3 but can't

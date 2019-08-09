@@ -3904,13 +3904,13 @@ static
 __attribute((noreturn))
 void sanityCheckFail ( const IRSB* bb, const IRStmt* stmt, const HChar* what )
 {
-   vex_printf("\nIR SANITY CHECK FAILURE\n\n");
+   printf("\nIR SANITY CHECK FAILURE\n\n");
    ppIRSB(bb);
    if (stmt) {
-      vex_printf("\nIN STATEMENT:\n\n");
+      printf("\nIN STATEMENT:\n\n");
       ppIRStmt(stmt);
    }
-   vex_printf("\n\nERROR = %s\n\n", what );
+   printf("\n\nERROR = %s\n\n", what );
    vpanic("sanityCheckFail: exiting due to bad IR");
 }
 
