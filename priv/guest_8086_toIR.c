@@ -151,6 +151,7 @@ static Bool ignore_seg_mode;
 #define R_DS 3
 #define R_FS 4
 #define R_GS 5
+#define FORCE_IGNORE_SEG 254
 #define UNDEFINED_SEG 255
 
 /* Add a statement to the list held by "irbb". */
@@ -482,6 +483,22 @@ static IRExpr* mkAnd1 ( IRExpr* x, IRExpr* y )
                      unop(Iop_1Uto32,y)));
 }
 
+#define is_bit_set(var,pos) ((var & (1<<pos))>>pos)
+#define SEG_SHIFT (4)
+
+static Bool ignoreRealAddr(UChar sreg)
+{
+   if(( !IS_EXPLICIT_BIT_SET(sreg) && ignore_seg_mode) || sreg == UNDEFINED_SEG || sreg == FORCE_IGNORE_SEG){
+      return True;
+   }
+   return False;
+}
+
+static IRExpr* realAddr( IRExpr* segaddr ,IRExpr* addr )
+{
+   return binop(Iop_Add32, addr, binop(Iop_Shl32, unop(Iop_16Uto32,segaddr), mkU8(SEG_SHIFT)));
+}
+
 /* Generate a compare-and-swap operation, operating on memory at
    'addr'.  The expected value is 'expVal' and the new value is
    'newVal'.  If the operation fails, then transfer control (with a
@@ -511,7 +528,17 @@ static void casLE ( IRExpr* addr, IRExpr* expVal, IRExpr* newVal,
          ));
 }
 
-
+/* this is currently unused, TODO clean later if someone uses CAS without disamode */
+static void casRealLE( IRExpr* addr, Int sreg ,IRExpr* expVal, IRExpr* newVal,
+                    Addr32 restart_point )
+{
+   if(ignoreRealAddr(sreg)){
+      casLE(addr, expVal, newVal, restart_point);
+      return;
+   }
+   casLE(realAddr(getSReg(sreg), addr) , expVal, newVal, restart_point);
+   return;
+}
 
 
 /*------------------------------------------------------------*/
@@ -895,8 +922,7 @@ void set_EFLAGS_from_value ( IRTemp t1,
    }
 }
 
-#define is_bit_set(var,pos) ((var & (1<<pos))>>pos)
-#define SEG_SHIFT (4)
+
 
 static
 UInt fix_ip(UInt Eip){
@@ -907,14 +933,9 @@ UInt fix_ip(UInt Eip){
    return (ip + (guest_CS_bbstart << SEG_SHIFT));
 }
 
-static IRExpr* realAddr( IRExpr* segaddr ,IRExpr* addr )
-{
-   return binop(Iop_Add32, addr, binop(Iop_Shl32, unop(Iop_16Uto32,segaddr), mkU8(SEG_SHIFT)));
-}
-
 static IRExpr* loadRealLE ( IRType ty, Int sreg , IRExpr* addr)
 {
-   if(( !IS_EXPLICIT_BIT_SET(sreg) && ignore_seg_mode) || sreg == UNDEFINED_SEG){
+   if(ignoreRealAddr(sreg)){
       return loadLE(ty, addr);
    }
    return loadLE( ty, realAddr(getSReg(sreg), addr ));
@@ -922,7 +943,7 @@ static IRExpr* loadRealLE ( IRType ty, Int sreg , IRExpr* addr)
 
 static void storeRealLE ( IRExpr* addr,Int sreg,  IRExpr* data)
 {
-   if((!IS_EXPLICIT_BIT_SET(sreg) && ignore_seg_mode) || sreg == UNDEFINED_SEG){
+   if(ignoreRealAddr(sreg)) {
       storeLE(addr, data);
       return;
    }
@@ -1028,11 +1049,11 @@ static void helper_ADC ( Int sz,
    if (taddr != IRTemp_INVALID) {
       if (texpVal == IRTemp_INVALID) {
          vassert(restart_point == 0);
-         storeRealLE( mkexpr(taddr),sorb, mkexpr(tres) );
+         storeLE( mkexpr(taddr), mkexpr(tres) );
       } else {
          vassert(typeOfIRTemp(irsb->tyenv, texpVal) == ty);
          /* .. and hence 'texpVal' has the same type as 'tres'. */
-         casLE( mkexpr(taddr),
+         casLE( mkexpr(taddr), 
                 mkexpr(texpVal), mkexpr(tres), restart_point );
       }
    }
@@ -1082,11 +1103,11 @@ static void helper_SBB ( Int sz,
    if (taddr != IRTemp_INVALID) {
       if (texpVal == IRTemp_INVALID) {
          vassert(restart_point == 0);
-         storeRealLE( mkexpr(taddr),sorb,  mkexpr(tres) );
+         storeLE( mkexpr(taddr),  mkexpr(tres) );
       } else {
          vassert(typeOfIRTemp(irsb->tyenv, texpVal) == ty);
          /* .. and hence 'texpVal' has the same type as 'tres'. */
-         casLE( mkexpr(taddr),
+         casLE( mkexpr(taddr), 
                 mkexpr(texpVal), mkexpr(tres), restart_point );
       }
    }
@@ -1394,7 +1415,14 @@ IRTemp disAMode ( Int* len, UChar* sorb, Int delta, HChar* buf ) {
      DIS(buf, "%s%d(%%bx)",sorbTxt(*sorb) ,d);
 	  break;
    }
-   return disAMode_copy2tmp(binop(Iop_Add32,unop(Iop_16Uto32,deref_vaddr),mkU32(d)));
+
+   if(ignoreRealAddr(*sorb)){
+      return disAMode_copy2tmp(binop(Iop_Add32,unop(Iop_16Uto32,deref_vaddr),mkU32(d)));
+   }
+   else
+   {
+      return disAMode_copy2tmp(realAddr(getSReg(*sorb),binop(Iop_Add32,unop(Iop_16Uto32,deref_vaddr),mkU32(d))));
+   }
 
 }
 
@@ -1600,7 +1628,7 @@ UInt dis_mul_E_G ( UChar       sorb,
       assign( te, getIReg(size, eregOfRM(rm)) );
    } else {
       IRTemp addr = disAMode( &alen, &sorb, delta0, dis_buf );
-      assign( te, loadRealLE(ty,sorb,mkexpr(addr)) );
+      assign( te, loadLE(ty,mkexpr(addr)) );
    }
 
    setFlags_MUL ( ty, te, tg, X86G_CC_OP_SMULB );
@@ -1657,6 +1685,7 @@ UInt dis_op2_G_E ( UChar       sorb,
    IRTemp  dst1 = newTemp(ty);
    IRTemp  src  = newTemp(ty);
    IRTemp  dst0 = newTemp(ty);
+   IRTemp  effective_addr;
    UChar   rm   = getIByte(delta0);
    IRTemp  addr = IRTemp_INVALID;
 
@@ -1707,7 +1736,7 @@ UInt dis_op2_G_E ( UChar       sorb,
    /* E refers to memory */    
    {
       addr = disAMode ( &len, &sorb, delta0, dis_buf);
-      assign(dst0, loadRealLE(ty,sorb,mkexpr(addr)));
+      assign(dst0, loadLE(ty,mkexpr(addr)));
       assign(src,  getIReg(size,gregOfRM(rm)));
 
       if (addSubCarry && op8 == Iop_Add8) {
@@ -1736,12 +1765,12 @@ UInt dis_op2_G_E ( UChar       sorb,
          if (keep) {
             if (locked) {
                if (0) vex_printf("locked case\n" );
-               casLE( mkexpr(addr),
+               casLE( mkexpr(addr), 
                       mkexpr(dst0)/*expval*/, 
                       mkexpr(dst1)/*newval*/, guest_EIP_curr_instr );
             } else {
                if (0) vex_printf("nonlocked case\n");
-               storeRealLE(mkexpr(addr), sorb,  mkexpr(dst1));
+               storeLE(mkexpr(addr),  mkexpr(dst1));
             }
          }
          if (isAddSub(op8))
@@ -1848,7 +1877,7 @@ UInt dis_op2_E_G ( UChar       sorb,
       /* E refers to memory */
       addr = disAMode ( &len, &sorb, delta0, dis_buf);
       assign( dst0, getIReg(size,gregOfRM(rm)) );
-      assign( src,  loadRealLE(szToITy(size),sorb, mkexpr(addr)) );
+      assign( src,  loadLE(szToITy(size), mkexpr(addr)) );
 
       if (addSubCarry && op8 == Iop_Add8) {
          helper_ADC( size, dst1, dst0, src,
@@ -1956,12 +1985,12 @@ UInt dis_movx_E_G ( UChar      sorb,
       if (szd == szs) {
          // mutant case.  See #250799
          putIReg(szd, gregOfRM(rm),
-                           loadRealLE(szToITy(szs),sorb,mkexpr(addr)));
+                           loadLE(szToITy(szs),mkexpr(addr)));
       } else {
          // normal case
          putIReg(szd, gregOfRM(rm),
                       unop(mkWidenOp(szs,szd,sign_extend), 
-                           loadRealLE(szToITy(szs),sorb,mkexpr(addr))));
+                           loadLE(szToITy(szs),mkexpr(addr))));
       }
       DIP("mov%c%c%c %s,%s\n", sign_extend ? 's' : 'z',
                                nameISize(szs), nameISize(szd),
@@ -2072,7 +2101,7 @@ UInt dis_Grp1 ( UChar sorb, Bool locked,
    } else {
       addr = disAMode ( &len, &sorb, delta, dis_buf);
 
-      assign(dst0, loadRealLE(ty, sorb,mkexpr(addr)));
+      assign(dst0, loadLE(ty,mkexpr(addr)));
       assign(src, mkU(ty,d32 & mask));
 
       if (gregOfRM(modrm) == 2 /* ADC */) {
@@ -2100,11 +2129,11 @@ UInt dis_Grp1 ( UChar sorb, Bool locked,
          assign(dst1, binop(mkSizedOp(ty,op8), mkexpr(dst0), mkexpr(src)));
          if (gregOfRM(modrm) < 7) {
             if (locked) {
-               casLE( mkexpr(addr), mkexpr(dst0)/*expVal*/, 
+               casLE( mkexpr(addr) , mkexpr(dst0)/*expVal*/, 
                                     mkexpr(dst1)/*newVal*/,
                                     guest_EIP_curr_instr );
             } else {
-               storeRealLE(mkexpr(addr),sorb, mkexpr(dst1));
+               storeLE(mkexpr(addr), mkexpr(dst1));
             }
          }
          if (isAddSub(op8))
@@ -2149,7 +2178,7 @@ UInt dis_Grp2 ( UChar sorb,
       delta += (am_sz + d_sz);
    } else {
       addr = disAMode ( &len, &sorb, delta, dis_buf);
-      assign(dst0, loadRealLE(ty,sorb,mkexpr(addr)));
+      assign(dst0, loadLE(ty,mkexpr(addr)));
       delta += len + d_sz;
    }
 
@@ -2346,7 +2375,7 @@ UInt dis_Grp2 ( UChar sorb,
          vex_printf(", %s\n", nameIReg(sz,eregOfRM(modrm)));
       }
    } else {
-      storeRealLE(mkexpr(addr),sorb, mkexpr(dst1));
+      storeLE(mkexpr(addr), mkexpr(dst1));
       if (vex_traceflags & VEX_TRACE_FE) {
          vex_printf("%s%c ",
                     nameGrp2(gregOfRM(modrm)), nameISize(sz) );
@@ -2416,7 +2445,7 @@ UInt dis_Grp8_Imm ( UChar sorb,
       Int len;
       t_addr = disAMode ( &len, &sorb, delta, dis_buf);
       delta  += (len+1);
-      assign( t2, widenUto32(loadRealLE(ty,sorb, mkexpr(t_addr))) );
+      assign( t2, widenUto32(loadLE(ty, mkexpr(t_addr))) );
       DIP("%s%c $0x%x, %s\n", nameGrp8(gregOfRM(modrm)), nameISize(sz),
                               src_val, dis_buf);
    }
@@ -2447,12 +2476,12 @@ UInt dis_Grp8_Imm ( UChar sorb,
          putIReg(sz, eregOfRM(modrm), narrowTo(ty, mkexpr(t2m)));
       } else {
          if (locked) {
-            casLE( mkexpr(t_addr),
+            casLE( mkexpr(t_addr), 
                    narrowTo(ty, mkexpr(t2))/*expd*/,
                    narrowTo(ty, mkexpr(t2m))/*new*/,
                    guest_EIP_curr_instr );
          } else {
-            storeRealLE(mkexpr(t_addr),sorb, narrowTo(ty, mkexpr(t2m)));
+            storeLE(mkexpr(t_addr), narrowTo(ty, mkexpr(t2m)));
          }
       }
    }
@@ -2630,7 +2659,7 @@ UInt dis_Grp3 ( UChar sorb, Bool locked, Int sz, Int delta, Bool* decode_OK )
       addr = disAMode ( &len, &sorb, delta, dis_buf );
       t1   = newTemp(ty);
       delta += len;
-      assign(t1, loadRealLE(ty,sorb, mkexpr(addr)));
+      assign(t1, loadLE(ty, mkexpr(addr)));
       switch (gregOfRM(modrm)) {
          case 0: { /* TEST */
             d32 = getUDisp(sz, delta); delta += sz;
@@ -2652,7 +2681,7 @@ UInt dis_Grp3 ( UChar sorb, Bool locked, Int sz, Int delta, Bool* decode_OK )
                casLE( mkexpr(addr), mkexpr(t1)/*expd*/, mkexpr(dst1)/*new*/,
                                     guest_EIP_curr_instr );
             } else {
-               storeRealLE( mkexpr(addr),sorb, mkexpr(dst1) );
+               storeLE( mkexpr(addr), mkexpr(dst1) );
             }
             DIP("not%c %s\n", nameISize(sz), dis_buf);
             break;
@@ -2665,10 +2694,10 @@ UInt dis_Grp3 ( UChar sorb, Bool locked, Int sz, Int delta, Bool* decode_OK )
             assign(dst1, binop(mkSizedOp(ty,Iop_Sub8),
                                mkexpr(dst0), mkexpr(src)));
             if (locked) {
-               casLE( mkexpr(addr), mkexpr(t1)/*expd*/, mkexpr(dst1)/*new*/,
+               casLE( mkexpr(addr),  mkexpr(t1)/*expd*/, mkexpr(dst1)/*new*/,
                                     guest_EIP_curr_instr );
             } else {
-               storeRealLE( mkexpr(addr),sorb, mkexpr(dst1) );
+               storeLE( mkexpr(addr), mkexpr(dst1) );
             }
             setFlags_DEP1_DEP2(Iop_Sub8, dst0, src, ty);
             DIP("neg%c %s\n", nameISize(sz), dis_buf);
@@ -2739,7 +2768,7 @@ UInt dis_Grp4 ( UChar sorb, Bool locked, Int delta, Bool* decode_OK )
                       nameIReg(1, eregOfRM(modrm)));
    } else {
       IRTemp addr = disAMode ( &alen, &sorb, delta, dis_buf );
-      assign( t1, loadRealLE(ty,sorb, mkexpr(addr)) );
+      assign( t1, loadLE(ty, mkexpr(addr)) );
       switch (gregOfRM(modrm)) {
          case 0: /* INC */
             assign(t2, binop(Iop_Add8, mkexpr(t1), mkU8(1)));
@@ -2747,17 +2776,17 @@ UInt dis_Grp4 ( UChar sorb, Bool locked, Int delta, Bool* decode_OK )
                casLE( mkexpr(addr), mkexpr(t1)/*expd*/, mkexpr(t2)/*new*/, 
                       guest_EIP_curr_instr );
             } else {
-               storeRealLE( mkexpr(addr),sorb, mkexpr(t2) );
+               storeLE( mkexpr(addr), mkexpr(t2) );
             }
             setFlags_INC_DEC( True, t2, ty );
             break;
          case 1: /* DEC */
             assign(t2, binop(Iop_Sub8, mkexpr(t1), mkU8(1)));
             if (locked) {
-               casLE( mkexpr(addr), mkexpr(t1)/*expd*/, mkexpr(t2)/*new*/, 
+               casLE( mkexpr(addr) , mkexpr(t1)/*expd*/, mkexpr(t2)/*new*/, 
                       guest_EIP_curr_instr );
             } else {
-               storeRealLE( mkexpr(addr),sorb, mkexpr(t2) );
+               storeLE( mkexpr(addr), mkexpr(t2) );
             }
             setFlags_INC_DEC( False, t2, ty );
             break;
@@ -2850,7 +2879,7 @@ UInt dis_Grp5 ( UChar sorb, Bool locked, Int sz, Int delta,
                        nameISize(sz), nameIReg(sz, eregOfRM(modrm)));
    } else {
       addr = disAMode ( &len, &sorb, delta, dis_buf );
-      assign(t1, loadRealLE(ty,sorb, mkexpr(addr)));
+      assign(t1, loadLE(ty, mkexpr(addr)));
       switch (gregOfRM(modrm)) {
          case 0: /* INC */ 
             t2 = newTemp(ty);
@@ -2860,7 +2889,7 @@ UInt dis_Grp5 ( UChar sorb, Bool locked, Int sz, Int delta,
                casLE( mkexpr(addr),
                       mkexpr(t1), mkexpr(t2), guest_EIP_curr_instr );
             } else {
-               storeRealLE(mkexpr(addr), sorb,mkexpr(t2));
+               storeLE(mkexpr(addr),mkexpr(t2));
             }
             setFlags_INC_DEC( True, t2, ty );
             break;
@@ -2872,7 +2901,7 @@ UInt dis_Grp5 ( UChar sorb, Bool locked, Int sz, Int delta,
                casLE( mkexpr(addr),
                       mkexpr(t1), mkexpr(t2), guest_EIP_curr_instr );
             } else {
-               storeRealLE(mkexpr(addr),sorb,mkexpr(t2));
+               storeLE(mkexpr(addr),mkexpr(t2));
             }
             setFlags_INC_DEC( False, t2, ty );
             break;
@@ -2932,7 +2961,7 @@ UInt dis_mov_Ew_Sw ( UChar sorb, Int delta0 )
       return 1+delta0;
    } else {
       addr = disAMode ( &len, &sorb, delta0, dis_buf );
-      putSReg( gregOfRM(rm), loadRealLE(Ity_I16,sorb, mkexpr(addr)));
+      putSReg( gregOfRM(rm), loadLE(Ity_I16, mkexpr(addr)));
       DIP("movw %s,%s\n", dis_buf, nameSReg(gregOfRM(rm)));
       return len+delta0;
    }
@@ -2956,7 +2985,7 @@ UInt dis_mov_Sw_Ew ( UChar sorb,
       return 1+delta0;
    } else {
       addr = disAMode ( &len, &sorb, delta0, dis_buf );
-      storeRealLE( mkexpr(addr),sorb,  getSReg(gregOfRM(rm)));
+      storeLE( mkexpr(addr),  getSReg(gregOfRM(rm)));
       DIP("mov %s,%s\n", nameSReg(gregOfRM(rm)), dis_buf);
       return len+delta0;
    }
@@ -2982,7 +3011,7 @@ UInt dis_mov_E_G ( UChar       sorb,
    /* E refers to memory */    
    {
       IRTemp addr = disAMode ( &len, &sorb, delta0, dis_buf );
-      putIReg(size, gregOfRM(rm), loadRealLE(szToITy(size), sorb, mkexpr(addr)));
+      putIReg(size, gregOfRM(rm), loadLE(szToITy(size), mkexpr(addr)));
       DIP("mov%c %s,%s\n", nameISize(size), 
                            dis_buf,nameIReg(size,gregOfRM(rm)));
       return delta0+len;
@@ -3009,7 +3038,7 @@ UInt dis_mov_G_E ( UChar       sorb,
    /* E refers to memory */    
    {
       IRTemp addr = disAMode ( &len, &sorb, delta0, dis_buf);
-      storeRealLE(mkexpr(addr), sorb ,getIReg(size, gregOfRM(rm)));
+      storeLE(mkexpr(addr),getIReg(size, gregOfRM(rm)));
       DIP("mov%c %s,%s\n", nameISize(size), 
                            nameIReg(size,gregOfRM(rm)), dis_buf);
       return len+delta0;
@@ -3034,7 +3063,7 @@ UInt dis_imul_I_E_G ( UChar       sorb,
       delta++;
    } else {
       IRTemp addr = disAMode( &alen, &sorb, delta, dis_buf );
-      assign(te, loadRealLE(Ity_I16, sorb ,mkexpr(addr)));
+      assign(te, loadLE(Ity_I16 ,mkexpr(addr)));
       delta += alen;
    }
    d32 = getSDisp(litsize,delta);
@@ -4020,8 +4049,8 @@ DisResult disInstr_8086_WRK (
       /* NOTE!  this is the one place where a segment override prefix
          has no effect on the address calculation.  Therefore we pass
          zero instead of sorb here. */
-      addr = disAMode ( &alen, &sorb, delta, dis_buf );
       sorb = UNDEFINED_SEG; /* no sorb for lea! */
+      addr = disAMode ( &alen, &sorb, delta, dis_buf );
       delta += alen;
       putIReg(2, gregOfRM(modrm), unop(Iop_32to16,mkexpr(addr)));
       DIP("lea%c %s, %s\n", nameISize(sz), dis_buf, 
@@ -4045,7 +4074,7 @@ DisResult disInstr_8086_WRK (
       if (sorb == UNDEFINED_SEG){
          sorb = R_DS;
       }
-      putIReg(sz, R_EAX, loadRealLE(ty, sorb, mkU16(d32)));
+      putIReg(sz, R_EAX, loadRealLE(ty, sorb, mkU32(d32)));
       DIP("mov%c %s0x%x, %s\n", nameISize(sz), sorbTxt(sorb),
                                 d32, nameIReg(sz,R_EAX));
       break;
@@ -4059,6 +4088,8 @@ DisResult disInstr_8086_WRK (
       if (sorb == UNDEFINED_SEG){
          sorb = R_DS;
       }
+      addr = newTemp(Ity_I32);
+      assign(addr, mkU32(d32));
       storeRealLE( mkexpr(addr),sorb , getIReg(sz,R_EAX) );
       DIP("mov%c %s, %s0x%x\n", nameISize(sz), nameIReg(sz,R_EAX),
                                 sorbTxt(sorb), d32);
@@ -4106,7 +4137,7 @@ DisResult disInstr_8086_WRK (
             addr = disAMode ( &alen, &sorb, delta, dis_buf );
             delta += alen;
             d32 = getUDisp(sz,delta); delta += sz;
-            storeRealLE(mkexpr(addr),sorb, mkU(szToITy(sz), d32));
+            storeLE(mkexpr(addr), mkU(szToITy(sz), d32));
             DIP("mov%c $0x%x, %s\n", nameISize(sz), d32, dis_buf);
          }
          break;
@@ -4352,22 +4383,30 @@ DisResult disInstr_8086_WRK (
       break;
 
    case 0x61: /* POPA */
-      /* This is almost certainly wrong for sz==2.  So ... */
-      if (sz != 4) goto decode_failure;
-
       /* t5 is the old %ESP value. */
-      t5 = newTemp(Ity_I32);
+      t5 = newTemp(Ity_I32); /* SP */
+      t4 = newTemp(Ity_I32); /* real address */
       assign( t5, getIReg(4, R_ESP) );
+      
+      /* optimize calculation of real address so we don't do it over and over again */
+      if(!ignore_seg_mode)
+      {
+         assign(t4, realAddr(getSReg(R_SS), mkexpr(t5)));
+      }
+      else
+      {
+         assign(t4, mkexpr(t5));
+      }
 
       /* Reload all the registers, except %esp. */
-      putIReg(4,R_EAX, loadRealLE(Ity_I32, R_SS, binop(Iop_Add32,mkexpr(t5),mkU32(14)) ));
-      putIReg(4,R_ECX, loadRealLE(Ity_I32, R_SS, binop(Iop_Add32,mkexpr(t5),mkU32(12)) ));
-      putIReg(4,R_EDX, loadRealLE(Ity_I32, R_SS, binop(Iop_Add32,mkexpr(t5),mkU32(10)) ));
-      putIReg(4,R_EBX, loadRealLE(Ity_I32, R_SS, binop(Iop_Add32,mkexpr(t5),mkU32(8)) ));
+      putIReg(4,R_EAX, loadLE(Ity_I32, binop(Iop_Add32,mkexpr(t4),mkU32(14)) ));
+      putIReg(4,R_ECX, loadLE(Ity_I32, binop(Iop_Add32,mkexpr(t4),mkU32(12)) ));
+      putIReg(4,R_EDX, loadLE(Ity_I32, binop(Iop_Add32,mkexpr(t4),mkU32(10)) ));
+      putIReg(4,R_EBX, loadLE(Ity_I32, binop(Iop_Add32,mkexpr(t4),mkU32(8)) ));
       /* ignore saved %ESP */
-      putIReg(4,R_EBP, loadRealLE(Ity_I32, R_SS, binop(Iop_Add32,mkexpr(t5),mkU32( 4)) ));
-      putIReg(4,R_ESI, loadRealLE(Ity_I32, R_SS, binop(Iop_Add32,mkexpr(t5),mkU32( 2)) ));
-      putIReg(4,R_EDI, loadRealLE(Ity_I32, R_SS, binop(Iop_Add32,mkexpr(t5),mkU32( 0)) ));
+      putIReg(4,R_EBP, loadLE(Ity_I32, binop(Iop_Add32,mkexpr(t4),mkU32( 4)) ));
+      putIReg(4,R_ESI, loadLE(Ity_I32, binop(Iop_Add32,mkexpr(t4),mkU32( 2)) ));
+      putIReg(4,R_EDI, loadLE(Ity_I32, binop(Iop_Add32,mkexpr(t4),mkU32( 0)) ));
 
       /* and move %ESP back up */
       putIReg( 4, R_ESP, binop(Iop_Add32, mkexpr(t5), mkU32(8*2)) );
@@ -4404,7 +4443,7 @@ DisResult disInstr_8086_WRK (
 
        /* resolve MODR/M */
        addr = disAMode ( &len, &sorb, delta, dis_buf);
-       storeRealLE( mkexpr(addr),sorb , mkexpr(t3) );
+       storeLE( mkexpr(addr) , mkexpr(t3) );
 
        DIP("pop%c %s\n", sz==2 ? 'w' : 'l', dis_buf);
 
@@ -4528,20 +4567,30 @@ DisResult disInstr_8086_WRK (
 
       /* t5 will be the new %ESP value. */
       t5 = newTemp(Ity_I32);
+      t4 = newTemp(Ity_I32); /* real address */
       assign( t5, binop(Iop_Sub32, mkexpr(t0), mkU32(8*2)) );
+      /* optimize calculation of real address so we don't do it over and over again */
+      if(!ignore_seg_mode)
+      {
+         assign(t4, realAddr(getSReg(R_SS), mkexpr(t5)));
+      }
+      else
+      {
+         assign(t4, mkexpr(t5));
+      }
 
       /* Update guest state before prodding memory. */
       putIReg(4, R_ESP, mkexpr(t5));
 
       /* Dump all the registers. */
-      storeRealLE( binop(Iop_Add32,mkexpr(t5),mkU32(14)), R_SS, getIReg(4,R_EAX) );
-      storeRealLE( binop(Iop_Add32,mkexpr(t5),mkU32(12)), R_SS, getIReg(4,R_ECX) );
-      storeRealLE( binop(Iop_Add32,mkexpr(t5),mkU32(10)), R_SS, getIReg(4,R_EDX) );
-      storeRealLE( binop(Iop_Add32,mkexpr(t5),mkU32( 8)), R_SS, getIReg(4,R_EBX) );
-      storeRealLE( binop(Iop_Add32,mkexpr(t5),mkU32( 6)), R_SS, mkexpr(t0) /*esp*/);
-      storeRealLE( binop(Iop_Add32,mkexpr(t5),mkU32( 4)), R_SS, getIReg(4,R_EBP) );
-      storeRealLE( binop(Iop_Add32,mkexpr(t5),mkU32( 2)), R_SS, getIReg(4,R_ESI) );
-      storeRealLE( binop(Iop_Add32,mkexpr(t5),mkU32( 0)), R_SS, getIReg(4,R_EDI) );
+      storeLE( binop(Iop_Add32,mkexpr(t4),mkU32(14)), getIReg(2,R_EAX) );
+      storeLE( binop(Iop_Add32,mkexpr(t4),mkU32(12)), getIReg(2,R_ECX) );
+      storeLE( binop(Iop_Add32,mkexpr(t4),mkU32(10)), getIReg(2,R_EDX) );
+      storeLE( binop(Iop_Add32,mkexpr(t4),mkU32( 8)), getIReg(2,R_EBX) );
+      storeLE( binop(Iop_Add32,mkexpr(t4),mkU32( 6)), mkexpr(t0) /*esp*/);
+      storeLE( binop(Iop_Add32,mkexpr(t4),mkU32( 4)), getIReg(2,R_EBP) );
+      storeLE( binop(Iop_Add32,mkexpr(t4),mkU32( 2)), getIReg(2,R_ESI) );
+      storeLE( binop(Iop_Add32,mkexpr(t4),mkU32( 0)), getIReg(2,R_EDI) );
 
       DIP("pusha%c\n", nameISize(sz));
       break;
@@ -4764,9 +4813,10 @@ DisResult disInstr_8086_WRK (
       } else {
          *expect_CAS = True;
          addr = disAMode ( &alen, &sorb, delta, dis_buf );
-         assign( t1, loadRealLE(ty,R_DS,mkexpr(addr)) );
+         /* we need to calculate the effective address for the cas... */
+         assign( t1, loadLE(ty,mkexpr(addr)) );
          assign( t2, getIReg(sz,gregOfRM(modrm)) );
-         casLE( mkexpr(addr),
+         casLE( mkexpr(addr), 
                 mkexpr(t1), mkexpr(t2), guest_EIP_curr_instr );
          putIReg( sz, gregOfRM(modrm), mkexpr(t1) );
          delta += alen;
@@ -4898,8 +4948,9 @@ DisResult disInstr_8086_WRK (
    /* ------------------------ (Grp1 extensions) ---------- */
 
    case 0x82: /* Grp1 Ib,Eb too.  Apparently this is the same as 
-                 case 0x80, but only in 32-bit mode. */
-      /* fallthru */
+                 case 0x80, but only in 32-bit mode. (0x82 is illegal in 8086 mode)
+                  but i see no reason not to let it fall through... */
+      /* fallthrough */
    case 0x80: /* Grp1 Ib,Eb */
       modrm = getIByte(delta);
       am_sz = lengthAMode(delta);
@@ -5271,7 +5322,7 @@ DisResult disInstr_8086_WRK (
          } else {
            addr = disAMode ( &alen, &sorb, delta, dis_buf );
            delta += alen;
-           storeRealLE( mkexpr(addr),sorb, mkexpr(t1) );
+           storeLE( mkexpr(addr), mkexpr(t1) );
            DIP("set%s %s\n", name_X86Condcode(opc-0x90), dis_buf);
          }
          break;
